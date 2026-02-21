@@ -1,0 +1,19 @@
+[mpd]
+# If you use SSH host aliases (e.g. "oblocal"), note those only resolve for SSH.
+# Use an IP address or a resolvable hostname/FQDN here.
+host = "localhost"
+port = 6600
+password = ""
+
+[lastfm]
+api_key = "YOUR_LASTFM_API_KEY"
+api_secret = "YOUR_LASTFM_API_SECRET"
+
+[cache]
+dir = ".gridmode-cache"
+
+[ui]
+columns = 5
+cell_size = 180
+padding = 12
+font = "Helvetica 10"

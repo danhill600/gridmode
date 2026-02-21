@@ -1,0 +1,4 @@
+config.toml
+.gridmode-cache/
+.venv/
+__pycache__/
