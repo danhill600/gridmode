@@ -19,11 +19,6 @@ from tkinter import ttk
 
 import requests
 
-try:
-    from PIL import ImageSequence
-except ImportError:
-    ImageSequence = None
-
 from gridmode_config import config_to_mapping, load_app_config
 from mpd_service import (
     delete_queue_album_occurrence,
@@ -41,13 +36,13 @@ from gridmode_cache import (
     fetch_database_album_records,
     fetch_playlist_album_records,
     ensure_dir,
+    get_cover_path,
     require_cfg,
+    safe_filename,
     _tag_to_str,
 )
-from ui_loading import loading_block_positions
 
 DEFAULT_CONFIG = "config.toml"
-LOADING_GIF = "assets/library-loading-alien.gif"
 APP_BG = "#073642"
 APP_BG_SELECTED = "#0b4a45"
 APP_FG = "#eee8d5"
@@ -106,6 +101,23 @@ def album_item(record, mtime=None):
         "mtime": mtime,
         "search_text": f"{record.artist} {record.album}".casefold(),
     }
+
+
+def release_year_from_song(song):
+    for tag in ("originaldate", "date", "releasedate", "year"):
+        value = _tag_to_str(song.get(tag, "")).strip()
+        match = re.search(r"\b(1[89]\d{2}|20\d{2})\b", value)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def release_year_from_songs(songs):
+    for song in songs:
+        year = release_year_from_song(song)
+        if year:
+            return year
+    return ""
 
 
 def library_index_path(cache_dir):
@@ -198,10 +210,6 @@ class GridModeApp:
         self.help_tab_visible = False
         self.help_return_view = "queue"
         self.nowplaying_rerender_id = None
-        self.loading_image_frames = []
-        self.loading_frame_durations = []
-        self.loading_current_image = None
-        self.loading_image_item = None
         self.loading_text_item = None
         self.loading_bg_item = None
 
@@ -243,7 +251,6 @@ class GridModeApp:
 
         self.canvas = tk.Canvas(self.content, highlightthickness=0, bg="#000000")
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.load_loading_animation()
 
         self.help_frame = ttk.Frame(self.content, padding=16)
         self.help_text = tk.Text(
@@ -770,49 +777,17 @@ json.dump(out, sys.stdout)
         if idx is not None:
             self.tabs.select(idx)
 
-    def load_loading_animation(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOADING_GIF)
-        if not os.path.exists(path):
-            return
-        if Image is None or ImageSequence is None:
-            try:
-                self.loading_image_frames = [tk.PhotoImage(file=path)]
-                self.loading_frame_durations = [140]
-            except tk.TclError:
-                logging.exception("Failed to load loading GIF")
-            return
-
-        try:
-            with Image.open(path) as image:
-                for frame in ImageSequence.Iterator(image):
-                    duration = int(frame.info.get("duration", 80) or 80)
-                    converted = frame.convert("RGBA")
-                    target_h = 150
-                    target_w = max(1, round(converted.width * (target_h / converted.height)))
-                    converted = converted.resize((target_w, target_h))
-                    background = Image.new("RGBA", converted.size, PANEL_BG)
-                    background.alpha_composite(converted)
-                    rgb = background.convert("RGB")
-                    ppm = f"P6 {rgb.width} {rgb.height} 255\n".encode("ascii") + rgb.tobytes()
-                    self.loading_image_frames.append(tk.PhotoImage(data=ppm, format="PPM"))
-                    self.loading_frame_durations.append(max(duration, 120))
-            logging.info("Loaded %d loading GIF frames", len(self.loading_image_frames))
-        except Exception:
-            logging.exception("Failed to load loading GIF frames")
-            self.loading_image_frames = []
-            self.loading_frame_durations = []
-
     def start_library_load(self, rebuild=False):
         if "library" in self.loading_views:
-            self.render_loading("Loading Library")
+            self.render_loading("hold up loading your library doggie")
             return
         self.loading_views.add("library")
         self.view_grid_cache.pop("library", None)
         self.view_loaded["library"] = False
         self.begin_loading_screen()
         self.root.update_idletasks()
-        self.render_loading("Loading Library")
-        self.start_loading_animation("Loading Library")
+        self.render_loading("hold up loading your library doggie")
+        self.start_loading_animation("hold up loading your library doggie")
         self.root.update_idletasks()
         self.root.after(80, self.start_library_load_worker, rebuild)
 
@@ -824,11 +799,20 @@ json.dump(out, sys.stdout)
         self.root.after(100, self.poll_load_results)
 
     def library_load_worker(self, rebuild):
+        started_at = time.monotonic()
         try:
             items = self.load_library_items(rebuild=rebuild)
+            items_loaded_at = time.monotonic()
             albums = [(item["artist"], item["album"]) for item in items]
             album_keys = [item["key"] for item in items]
             cover_paths, covers_ok, covers_failed = self.cover_paths_for(albums, album_keys)
+            covers_loaded_at = time.monotonic()
+            logging.info(
+                "Library load timings: items=%.3fs covers=%.3fs total=%.3fs",
+                items_loaded_at - started_at,
+                covers_loaded_at - items_loaded_at,
+                covers_loaded_at - started_at,
+            )
             self.load_result_queue.put(
                 {
                     "view": "library",
@@ -908,24 +892,18 @@ json.dump(out, sys.stdout)
     def clear_loading_items(self):
         self.canvas.delete("loading")
         self.loading_bg_item = None
-        self.loading_image_item = None
         self.loading_text_item = None
-        self.loading_current_image = None
 
     def begin_loading_screen(self):
         self.canvas.delete("all")
         self.loading_bg_item = None
-        self.loading_image_item = None
         self.loading_text_item = None
-        self.loading_current_image = None
 
     def animate_loading(self):
         if self.active_view == "library" and "library" in self.loading_views:
             self.render_loading(self.loading_text)
             self.loading_frame += 1
             delay = 160
-            if self.loading_frame_durations:
-                delay = max(self.loading_frame_durations[self.loading_frame % len(self.loading_frame_durations)], 160)
             self.loading_after_id = self.root.after(delay, self.animate_loading)
         else:
             self.loading_after_id = None
@@ -948,45 +926,6 @@ json.dump(out, sys.stdout)
             self.canvas.tag_lower(self.loading_bg_item)
         else:
             self.canvas.coords(self.loading_bg_item, 0, 0, width, height)
-        if self.loading_image_frames:
-            frame_idx = self.loading_frame % len(self.loading_image_frames)
-            image = self.loading_image_frames[frame_idx]
-            self.loading_current_image = image
-            x = width // 2
-            image_y, text_y = loading_block_positions(
-                width,
-                height,
-                image.height(),
-                self.loading_font.metrics("linespace"),
-            )
-            if self.loading_image_item is None:
-                self.loading_image_item = self.canvas.create_image(
-                    x,
-                    image_y,
-                    image=image,
-                    anchor="center",
-                    tags=("loading",),
-                )
-                self.canvas.tag_raise(self.loading_image_item)
-            else:
-                self.canvas.coords(self.loading_image_item, x, image_y)
-                self.canvas.itemconfigure(self.loading_image_item, image=image)
-            if self.loading_text_item is None:
-                self.loading_text_item = self.canvas.create_text(
-                    x,
-                    text_y,
-                    text=text,
-                    fill=APP_FG,
-                    font=self.loading_font,
-                    anchor="center",
-                    tags=("loading",),
-                )
-                self.canvas.tag_raise(self.loading_text_item)
-            else:
-                self.canvas.coords(self.loading_text_item, x, text_y)
-                self.canvas.itemconfigure(self.loading_text_item, text=text)
-            self.update_status(text.lower())
-            return
 
         spinner = "|/-\\"[self.loading_frame % 4]
         if self.loading_text_item is None:
@@ -1011,18 +950,50 @@ json.dump(out, sys.stdout)
         return paths
 
     def cover_paths_for(self, albums, album_keys):
+        cover_lookup = self.cover_file_lookup()
         paths = []
         covers_ok = 0
         covers_failed = 0
         for idx, (artist, album) in enumerate(albums):
             album_key = album_keys[idx] if idx < len(album_keys) else None
-            path = cached_cover_path(self.cache_dir, artist, album, album_key=album_key)
+            path = self.cached_cover_path_from_lookup(cover_lookup, artist, album, album_key)
             paths.append(path)
             if path:
                 covers_ok += 1
             else:
                 covers_failed += 1
         return paths, covers_ok, covers_failed
+
+    def cover_file_lookup(self):
+        try:
+            names = sorted(os.listdir(self.cache_dir))
+        except OSError:
+            return {"names": set(), "prefix": {}}
+        name_set = set(names)
+        prefix = {}
+        for name in names:
+            if not name.endswith(".png") or "--" not in name:
+                continue
+            label = name.split("--", 1)[0]
+            prefix.setdefault(label, name)
+        return {"names": name_set, "prefix": prefix}
+
+    def cached_cover_path_from_lookup(self, lookup, artist, album, album_key):
+        path = get_cover_path(self.cache_dir, artist, album, album_key=album_key)
+        name = os.path.basename(path)
+        if name in lookup["names"]:
+            return path
+
+        legacy_path = get_cover_path(self.cache_dir, artist, album)
+        legacy_name = os.path.basename(legacy_path)
+        if legacy_name != name and legacy_name in lookup["names"]:
+            return legacy_path
+
+        label = safe_filename(f"{artist} - {album}")
+        fallback_name = lookup["prefix"].get(label)
+        if fallback_name:
+            return os.path.join(self.cache_dir, fallback_name)
+        return None
 
     def reset_images(self):
         self.image_cache.clear()
@@ -1621,6 +1592,7 @@ json.dump(out, sys.stdout)
         return {
             "artist": artist,
             "album": album,
+            "year": release_year_from_songs(songs),
             "key": album_key,
             "rel_dir": item.get("rel_dir", ""),
             "current": None,
@@ -1689,6 +1661,7 @@ json.dump(out, sys.stdout)
         return {
             "artist": artist,
             "album": album,
+            "year": release_year_from_songs(album_block) or release_year_from_song(current),
             "key": current_key,
             "rel_dir": rel_dir,
             "current": current,
@@ -1718,7 +1691,10 @@ json.dump(out, sys.stdout)
         else:
             self.nowplaying_cover = make_placeholder(self.nowplaying_cover_size)
         self.nowplaying_cover_label.configure(image=self.nowplaying_cover)
-        self.nowplaying_title.configure(text=f"{info['artist']}\n{info['album']}")
+        title_lines = [info["artist"], info["album"]]
+        if info.get("year"):
+            title_lines.append(str(info["year"]))
+        self.nowplaying_title.configure(text="\n".join(title_lines))
 
         lines = [self.track_line(info, track) for track in info["tracks"]]
         padded_lines = [self.pad_track_line(line) for line in lines]
