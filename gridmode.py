@@ -5,6 +5,7 @@ import logging
 import os
 import posixpath
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -220,6 +221,7 @@ class GridModeApp:
         self.view_loaded = {"queue": False, "library": False}
         self.view_selected_indices = {"queue": 0, "library": 0}
         self.view_grid_cache = {}
+        self.pending_leader = None
         self.info_tab_visible = False
         self.info_return_view = "queue"
         self.info_album = None
@@ -347,16 +349,25 @@ class GridModeApp:
         self.canvas.bind_all("<Button-4>", self.on_mousewheel)
         self.canvas.bind_all("<Button-5>", self.on_mousewheel)
 
-        self.bind_repeating_key("Left", lambda: self.move_selection(-1, 0))
-        self.bind_repeating_key("Right", lambda: self.move_selection(1, 0))
-        self.bind_repeating_key("Up", lambda: self.move_vertical(-1))
-        self.bind_repeating_key("Down", lambda: self.move_vertical(1))
+        arrow_intercepts = (self.tabs, self.canvas, self.track_text, self.bio_text)
+        self.bind_repeating_key("Left", lambda: self.move_selection(-1, 0), intercept_widgets=arrow_intercepts)
+        self.bind_repeating_key("Right", lambda: self.move_selection(1, 0), intercept_widgets=arrow_intercepts)
+        self.bind_repeating_key("Up", lambda: self.move_vertical(-1), intercept_widgets=arrow_intercepts)
+        self.bind_repeating_key("Down", lambda: self.move_vertical(1), intercept_widgets=arrow_intercepts)
         self.bind_repeating_key("h", lambda: self.move_selection(-1, 0))
         self.bind_repeating_key("l", lambda: self.move_selection(1, 0))
         self.bind_repeating_key("k", lambda: self.move_vertical(-1))
         self.bind_repeating_key("j", lambda: self.move_vertical(1))
         self.bind_repeating_key("J", lambda: self.move_pane_or_page(1))
         self.bind_repeating_key("K", lambda: self.move_pane_or_page(-1))
+        self.bind_repeating_key("Next", lambda: self.move_pane_or_page(1), intercept_widgets=arrow_intercepts)
+        self.bind_repeating_key("Prior", lambda: self.move_pane_or_page(-1), intercept_widgets=arrow_intercepts)
+        self.root.bind_all("H", lambda e: self.switch_relative_tab(-1))
+        self.root.bind_all("L", lambda e: self.switch_relative_tab(1))
+        self.root.bind_all("g", lambda e: self.handle_g_key())
+        self.root.bind_all("G", lambda e: self.jump_grid_position("bottom"))
+        self.root.bind_all("M", lambda e: self.jump_grid_position("middle"))
+        self.root.bind_all("z", lambda e: self.jump_grid_position("random"))
         self.root.bind_all("<Return>", lambda e: self.on_select())
         self.root.bind_all("<Tab>", lambda e: self.toggle_text_pane_focus())
         self.root.bind_all("<ISO_Left_Tab>", lambda e: self.toggle_text_pane_focus())
@@ -402,7 +413,7 @@ class GridModeApp:
             foreground=[("selected", APP_FG)],
         )
 
-    def bind_repeating_key(self, key, action):
+    def bind_repeating_key(self, key, action, intercept_widgets=()):
         self.root.bind_all(
             f"<KeyPress-{key}>",
             lambda event, key=key, action=action: self.start_key_repeat(key, action),
@@ -411,8 +422,21 @@ class GridModeApp:
             f"<KeyRelease-{key}>",
             lambda event, key=key: self.schedule_key_repeat_stop(key),
         )
+        for widget in intercept_widgets:
+            widget.bind(
+                f"<KeyPress-{key}>",
+                lambda event, key=key, action=action: self.start_key_repeat(key, action),
+            )
+            widget.bind(
+                f"<KeyRelease-{key}>",
+                lambda event, key=key: self.schedule_key_repeat_stop(key),
+            )
 
     def start_key_repeat(self, key, action):
+        if self.pending_leader:
+            self.pending_leader = None
+            self.update_status("command cancelled")
+            return "break"
         if self.active_view == "help":
             return "break"
         if self.key_release_id is not None:
@@ -590,14 +614,18 @@ class GridModeApp:
                 pass
 
     def load_library_items(self, rebuild=False):
+        cached_items = self.load_library_index()
         if not rebuild:
-            cached_items = self.load_library_index()
             if cached_items:
                 self.library_error = ""
                 return cached_items
 
         records = self.load_records(library=True)
         mtimes = self.load_library_mtimes(records)
+        if mtimes is None:
+            if cached_items:
+                return cached_items
+            mtimes = {}
         items = [album_item(record, mtimes.get(record.rel_dir)) for record in records]
         items.sort(
             key=lambda item: (
@@ -681,7 +709,7 @@ json.dump(out, sys.stdout)
 """
         try:
             proc = subprocess.run(
-                ["ssh", ssh_host, "python3 -c " + shlex.quote(script)],
+                ["ssh", "-o", "BatchMode=yes", ssh_host, "python3 -c " + shlex.quote(script)],
                 input=json.dumps({"root": music_root, "rel_dirs": rel_dirs}),
                 text=True,
                 capture_output=True,
@@ -691,18 +719,18 @@ json.dump(out, sys.stdout)
         except (OSError, subprocess.SubprocessError) as e:
             self.library_error = f"library mtime error: {e}"
             logging.exception("Failed to load library mtimes")
-            return {}
+            return None
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
             self.library_error = f"library mtime error: {stderr or proc.returncode}"
             logging.warning("Failed to load library mtimes: %s", stderr or proc.returncode)
-            return {}
+            return None
         try:
             return {key: float(value) for key, value in json.loads(proc.stdout).items()}
         except (TypeError, ValueError, json.JSONDecodeError):
             self.library_error = "library mtime error: bad ssh output"
             logging.exception("Bad library mtime output")
-            return {}
+            return None
 
     def on_tab_changed(self, event=None):
         tab_id = self.tabs.select()
@@ -761,6 +789,21 @@ json.dump(out, sys.stdout)
             self.update_status(f"no tab {idx + 1}")
             return
         self.tabs.select(idx)
+        return "break"
+
+    def switch_relative_tab(self, direction):
+        visible_tabs = list(self.tabs.tabs())
+        if not visible_tabs:
+            return "break"
+        current = self.tabs.select()
+        try:
+            idx = visible_tabs.index(current)
+        except ValueError:
+            idx = 0
+        next_idx = max(0, min(len(visible_tabs) - 1, idx + direction))
+        if next_idx != idx:
+            self.tabs.select(visible_tabs[next_idx])
+        return "break"
 
     def view_tab_index(self, view):
         labels = {"queue": "Queue", "library": "Library", "nowplaying": "Now Playing", "info": "Info"}
@@ -1098,7 +1141,6 @@ json.dump(out, sys.stdout)
                     outline="#7fff00",
                     width=4,
                 )
-
     def title_text(self, artist, max_width):
         return elide_text(artist, self.title_font, max_width)
 
@@ -1172,6 +1214,37 @@ json.dump(out, sys.stdout)
         self.tabs.select(self.help_tab)
         return "break"
 
+    def handle_g_key(self):
+        if self.active_view not in ("queue", "library"):
+            return "break"
+        if self.pending_leader == "g":
+            self.pending_leader = None
+            return self.jump_grid_position("top")
+        self.pending_leader = "g"
+        self.update_status("g: press g for top")
+        return "break"
+
+    def jump_grid_position(self, where):
+        self.pending_leader = None
+        if self.active_view not in ("queue", "library") or not self.albums:
+            return "break"
+        if where == "top":
+            idx = 0
+        elif where == "bottom":
+            idx = len(self.albums) - 1
+        elif where == "middle":
+            idx = len(self.albums) // 2
+        elif where == "random":
+            idx = random.randrange(len(self.albums))
+        else:
+            return "break"
+        self.view_selected_indices[self.active_view] = idx
+        self.selected_index = idx
+        self.last_selected_index = None
+        self.ensure_visible(idx)
+        self.render_visible()
+        return "break"
+
     def close_key_help(self):
         return_view = self.help_return_view if self.help_return_view in ("queue", "library", "nowplaying", "info") else "queue"
         if self.help_tab_visible:
@@ -1197,6 +1270,12 @@ json.dump(out, sys.stdout)
                 "  k / Up     move up",
                 "  J          page down",
                 "  K          page up",
+                "  PageDown   page down",
+                "  PageUp     page up",
+                "  z          jump to random album",
+                "  gg         jump to top",
+                "  G          jump to bottom",
+                "  M          jump to middle",
                 "  mouse      scroll and click to select",
                 "",
                 "Queue",
@@ -1226,6 +1305,7 @@ json.dump(out, sys.stdout)
                 "  o          jump highlight to currently playing track",
                 "",
                 "Global",
+                "  H / L      move to previous / next tab",
                 "  f          toggle fullscreen",
                 "  Esc        exit fullscreen",
                 "  ?          show this help",
