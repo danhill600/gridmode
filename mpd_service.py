@@ -1,4 +1,5 @@
 import posixpath
+import time
 
 from gridmode_cache import _tag_to_str, album_group_key
 
@@ -93,6 +94,40 @@ def delete_queue_album_occurrence(client, item):
     for pos in sorted(positions, reverse=True):
         client.delete(str(pos))
     return {"ok": True, "stale": False, "deleted": len(positions)}
+
+
+def save_current_queue_as_playlist(client, name):
+    name = clean_playlist_name(name)
+    if not name:
+        return {"ok": False, "error": "empty_name"}
+    tmp_name = f".gridmode-save-{int(time.time() * 1000)}"
+    client.save(tmp_name)
+    try:
+        try:
+            client.rm(name)
+        except Exception:
+            pass
+        client.rename(tmp_name, name)
+    except Exception:
+        try:
+            client.rm(tmp_name)
+        except Exception:
+            pass
+        raise
+    return {"ok": True, "name": name}
+
+
+def append_current_song_to_playlist(client, playlist_name):
+    song = client.currentsong()
+    file_path = _tag_to_str(song.get("file", "")).strip()
+    if not file_path:
+        return {"ok": False, "error": "no_current_song"}
+    client.playlistadd(clean_playlist_name(playlist_name), file_path)
+    return {"ok": True, "playlist": clean_playlist_name(playlist_name), "file": file_path}
+
+
+def clean_playlist_name(name):
+    return str(name or "").strip()
 
 
 def song_playlist_position(song):

@@ -16,15 +16,17 @@ import tkinter.font as tkfont
 import time
 import threading
 from collections import OrderedDict
-from tkinter import ttk
+from tkinter import simpledialog, ttk
 
 import requests
 
 from gridmode_config import config_to_mapping, load_app_config
 from mpd_service import (
     delete_queue_album_occurrence,
+    append_current_song_to_playlist,
     play_queue_album,
     queue_items_from_playlist,
+    save_current_queue_as_playlist,
     song_playlist_position,
 )
 from gridmode_cache import (
@@ -222,6 +224,9 @@ class GridModeApp:
         self.view_selected_indices = {"queue": 0, "library": 0}
         self.view_grid_cache = {}
         self.pending_leader = None
+        self.current_playlist_name = None
+        self.library_search_query = ""
+        self.library_search_matches = []
         self.info_tab_visible = False
         self.info_return_view = "queue"
         self.info_album = None
@@ -247,6 +252,19 @@ class GridModeApp:
 
         self.status = ttk.Label(self.root, text="")
         self.status.pack(side="bottom", fill="x")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(self.root, textvariable=self.search_var, style="Search.TEntry")
+        self.search_entry.bind("<Return>", self.finish_library_search)
+        self.search_entry.bind("<Escape>", self.cancel_library_search)
+        self.search_entry.bind("<Control-u>", self.clear_library_search_entry)
+        self.search_entry.bind("<KeyPress>", lambda event: None)
+        self.search_entry.bindtags(
+            tuple(
+                tag
+                for tag in self.search_entry.bindtags()
+                if tag not in ("all", str(self.root))
+            )
+        )
 
         self.content = ttk.Frame(self.root)
         self.content.pack(side="top", fill="both", expand=True)
@@ -368,6 +386,12 @@ class GridModeApp:
         self.root.bind_all("G", lambda e: self.jump_grid_position("bottom"))
         self.root.bind_all("M", lambda e: self.jump_grid_position("middle"))
         self.root.bind_all("z", lambda e: self.jump_grid_position("random"))
+        self.root.bind_all("s", lambda e: self.save_current_playlist())
+        self.root.bind_all("S", lambda e: self.save_current_playlist_as())
+        self.root.bind_all("t", lambda e: self.append_current_song_to_sick_tunes())
+        self.root.bind_all("/", lambda e: self.begin_library_search())
+        self.root.bind_all("n", lambda e: self.next_library_search_match(1))
+        self.root.bind_all("N", lambda e: self.next_library_search_match(-1))
         self.root.bind_all("<Return>", lambda e: self.on_select())
         self.root.bind_all("<Tab>", lambda e: self.toggle_text_pane_focus())
         self.root.bind_all("<ISO_Left_Tab>", lambda e: self.toggle_text_pane_focus())
@@ -382,7 +406,7 @@ class GridModeApp:
         self.root.bind_all("?", lambda e: self.show_key_help())
         self.root.bind("f", lambda e: self.toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self.set_fullscreen(False))
-        self.root.bind("r", lambda e: self.refresh(rebuild=True))
+        self.root.bind("r", lambda e: self.refresh_from_key())
         self.root.bind_all("q", lambda e: self.close_info_or_quit())
         self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
@@ -407,6 +431,7 @@ class GridModeApp:
         self.style.configure("TNotebook.Tab", background=APP_BG, foreground=APP_FG, padding=(8, 3))
         self.style.configure("Pane.TFrame", background=APP_BG, borderwidth=2, relief="flat")
         self.style.configure("FocusedPane.TFrame", background=APP_ACCENT, borderwidth=2, relief="solid")
+        self.style.configure("Search.TEntry", foreground="#3a3a3a")
         self.style.map(
             "TNotebook.Tab",
             background=[("selected", APP_BG_SELECTED)],
@@ -552,6 +577,12 @@ class GridModeApp:
             self.covers_ok,
             self.covers_failed,
         )
+
+    def refresh_from_key(self):
+        if self.search_entry.winfo_ismapped():
+            return "break"
+        self.refresh(rebuild=True)
+        return "break"
 
     def prepare_active_grid(self, use_cache=True):
         if use_cache and self.apply_grid_cache(self.active_view):
@@ -1245,6 +1276,78 @@ json.dump(out, sys.stdout)
         self.render_visible()
         return "break"
 
+    def begin_library_search(self):
+        if self.active_view != "library":
+            return "break"
+        self.pending_leader = None
+        if not self.search_entry.winfo_ismapped():
+            self.search_entry.pack(side="bottom", fill="x", before=self.status)
+        self.search_var.set(self.library_search_query)
+        self.search_entry.focus_set()
+        self.search_entry.icursor("end")
+        self.update_status("search library: artist or album")
+        return "break"
+
+    def finish_library_search(self, event=None):
+        query = self.search_var.get().strip()
+        self.search_entry.pack_forget()
+        self.canvas.focus_set()
+        if not query:
+            self.library_search_query = ""
+            self.library_search_matches = []
+            self.update_status("search cleared")
+            return "break"
+        self.library_search_query = query
+        folded = query.casefold()
+        self.library_search_matches = [
+            idx
+            for idx, item in enumerate(self.view_items["library"])
+            if folded in item.get("search_text", "").casefold()
+        ]
+        if not self.library_search_matches:
+            self.update_status(f"no matches: {query}")
+            return "break"
+        self.jump_to_search_match(1, include_current=True)
+        return "break"
+
+    def cancel_library_search(self, event=None):
+        self.search_entry.pack_forget()
+        self.canvas.focus_set()
+        self.update_status("search cancelled")
+        return "break"
+
+    def clear_library_search_entry(self, event=None):
+        self.search_var.set("")
+        return "break"
+
+    def next_library_search_match(self, direction):
+        if self.active_view != "library":
+            return "break"
+        if not self.library_search_query:
+            self.update_status("no active search")
+            return "break"
+        if not self.library_search_matches:
+            self.update_status(f"no matches: {self.library_search_query}")
+            return "break"
+        self.jump_to_search_match(direction)
+        return "break"
+
+    def jump_to_search_match(self, direction, include_current=False):
+        matches = self.library_search_matches
+        current = self.selected_index
+        if direction >= 0:
+            candidates = [idx for idx in matches if idx >= current] if include_current else [idx for idx in matches if idx > current]
+            idx = candidates[0] if candidates else matches[0]
+        else:
+            candidates = [idx for idx in matches if idx <= current] if include_current else [idx for idx in matches if idx < current]
+            idx = candidates[-1] if candidates else matches[-1]
+        self.view_selected_indices["library"] = idx
+        self.selected_index = idx
+        self.last_selected_index = None
+        self.ensure_visible(idx)
+        self.render_visible()
+        self.update_status(f"search {self.library_search_matches.index(idx) + 1}/{len(matches)}: {self.library_search_query}")
+
     def close_key_help(self):
         return_view = self.help_return_view if self.help_return_view in ("queue", "library", "nowplaying", "info") else "queue"
         if self.help_tab_visible:
@@ -1283,8 +1386,12 @@ json.dump(out, sys.stdout)
                 "  d          remove selected album from current playlist",
                 "  i          open selected album info",
                 "  o          jump selection to currently playing album",
+                "  s          save current playlist",
+                "  S          save current playlist as",
                 "",
                 "Library",
+                "  /          search artist or album",
+                "  n / N      next / previous search match",
                 "  Enter      insert selected album after current album and play it",
                 "  a          insert selected album after current album",
                 "  A          append selected album to end of playlist",
@@ -1306,6 +1413,7 @@ json.dump(out, sys.stdout)
                 "",
                 "Global",
                 "  H / L      move to previous / next tab",
+                "  t          add current song to sick_tunes",
                 "  f          toggle fullscreen",
                 "  Esc        exit fullscreen",
                 "  ?          show this help",
@@ -1960,6 +2068,78 @@ json.dump(out, sys.stdout)
         if item is None:
             return "break"
         self.append_library_album_to_playlist(item)
+        return "break"
+
+    def save_current_playlist(self):
+        if self.active_view != "queue":
+            return "break"
+        if not self.current_playlist_name:
+            return self.save_current_playlist_as()
+        self.save_queue_to_stored_playlist(self.current_playlist_name)
+        return "break"
+
+    def save_current_playlist_as(self):
+        if self.active_view != "queue":
+            return "break"
+        name = simpledialog.askstring(
+            "Save playlist as",
+            "Playlist name:",
+            initialvalue=self.current_playlist_name or "",
+            parent=self.root,
+        )
+        if not name:
+            self.update_status("playlist save cancelled")
+            return "break"
+        self.save_queue_to_stored_playlist(name)
+        return "break"
+
+    def save_queue_to_stored_playlist(self, name):
+        mpd_host = require_cfg(self.cfg, "mpd", "host")
+        mpd_port = require_cfg(self.cfg, "mpd", "port")
+        mpd_password = self.cfg.get("mpd", {}).get("password", "")
+        try:
+            client = connect_mpd(mpd_host, mpd_port, mpd_password, timeout=30)
+            try:
+                result = save_current_queue_as_playlist(client, name)
+            finally:
+                try:
+                    client.close()
+                    client.disconnect()
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.exception("Failed to save current playlist")
+            self.update_status(f"playlist save error: {e}")
+            return
+        if result.get("ok"):
+            self.current_playlist_name = result["name"]
+            self.update_status(f"saved playlist: {self.current_playlist_name}")
+        else:
+            self.update_status(f"playlist save error: {result.get('error', 'unknown')}")
+
+    def append_current_song_to_sick_tunes(self):
+        mpd_host = require_cfg(self.cfg, "mpd", "host")
+        mpd_port = require_cfg(self.cfg, "mpd", "port")
+        mpd_password = self.cfg.get("mpd", {}).get("password", "")
+        playlist_name = "sick_tunes"
+        try:
+            client = connect_mpd(mpd_host, mpd_port, mpd_password, timeout=30)
+            try:
+                result = append_current_song_to_playlist(client, playlist_name)
+            finally:
+                try:
+                    client.close()
+                    client.disconnect()
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.exception("Failed to append current song to sick_tunes")
+            self.update_status(f"sick_tunes error: {e}")
+            return "break"
+        if result.get("ok"):
+            self.update_status(f"added current song to {playlist_name}")
+        else:
+            self.update_status(f"{playlist_name} error: {result.get('error', 'unknown')}")
         return "break"
 
     def selected_queue_item(self):

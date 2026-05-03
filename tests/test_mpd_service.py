@@ -1,6 +1,13 @@
 import unittest
+from unittest.mock import patch
 
-from mpd_service import delete_queue_album_occurrence, play_queue_album, queue_items_from_playlist
+from mpd_service import (
+    append_current_song_to_playlist,
+    delete_queue_album_occurrence,
+    play_queue_album,
+    queue_items_from_playlist,
+    save_current_queue_as_playlist,
+)
 
 
 def song(pos, artist, album, file_path, albumartist=""):
@@ -20,6 +27,10 @@ class FakeClient:
         self._playlist = list(playlist)
         self.played = []
         self.deleted = []
+        self.saved = []
+        self.removed_playlists = []
+        self.renamed = []
+        self.playlist_added = []
 
     def playlistinfo(self):
         return list(self._playlist)
@@ -29,6 +40,21 @@ class FakeClient:
 
     def delete(self, pos):
         self.deleted.append(pos)
+
+    def save(self, name):
+        self.saved.append(name)
+
+    def rm(self, name):
+        self.removed_playlists.append(name)
+
+    def rename(self, old, new):
+        self.renamed.append((old, new))
+
+    def currentsong(self):
+        return self._playlist[0] if self._playlist else {}
+
+    def playlistadd(self, playlist, file_path):
+        self.playlist_added.append((playlist, file_path))
 
 
 class QueueOccurrenceTests(unittest.TestCase):
@@ -88,6 +114,25 @@ class QueueOccurrenceTests(unittest.TestCase):
 
         self.assertTrue(play_queue_album(client, selected))
         self.assertEqual(client.played, ["10"])
+
+    def test_save_current_queue_replaces_stored_playlist(self):
+        client = FakeClient([])
+
+        with patch("mpd_service.time.time", return_value=123.456):
+            result = save_current_queue_as_playlist(client, " road trip ")
+
+        self.assertEqual(result, {"ok": True, "name": "road trip"})
+        self.assertEqual(client.saved, [".gridmode-save-123456"])
+        self.assertEqual(client.removed_playlists, ["road trip"])
+        self.assertEqual(client.renamed, [(".gridmode-save-123456", "road trip")])
+
+    def test_append_current_song_to_playlist_uses_single_file(self):
+        client = FakeClient([song(0, "Artist", "Album", "a/01.flac")])
+
+        result = append_current_song_to_playlist(client, "sick_tunes")
+
+        self.assertEqual(result, {"ok": True, "playlist": "sick_tunes", "file": "a/01.flac"})
+        self.assertEqual(client.playlist_added, [("sick_tunes", "a/01.flac")])
 
 
 if __name__ == "__main__":
