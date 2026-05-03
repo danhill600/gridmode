@@ -63,11 +63,16 @@ Useful options:
 .venv/bin/python hydrate_covers.py --playlist
 .venv/bin/python hydrate_covers.py --limit 100
 .venv/bin/python hydrate_covers.py --no-local
+.venv/bin/python hydrate_covers.py --no-musicbrainz
 .venv/bin/python hydrate_covers.py --no-lastfm
+.venv/bin/python hydrate_covers.py --only-failures --no-lastfm
 ```
 
-Last.fm requests are rate-limited. Local cover lookup is disabled when
-`music.root` is empty or when `--no-local` is passed.
+Hydration tries local cover art first, then MusicBrainz/Cover Art Archive, then
+Last.fm. MusicBrainz and Last.fm requests are rate-limited. Local cover lookup
+is disabled when `music.root` is empty or when `--no-local` is passed. Progress
+is written to `hydrate.log` in the configured cache directory by default; use
+`--log-file /tmp/hydrate.log` to override it or `--no-log` to disable it.
 
 ## Current Keys
 

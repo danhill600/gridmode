@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 from gridmode_cache import (
     DEFAULT_USER_AGENT,
@@ -37,12 +38,16 @@ def parse_args():
     parser.add_argument("--music-root", default=None, help="music root matching MPD file paths")
     parser.add_argument("--ssh-host", default=None, help="SSH host for reading remote local art; empty disables SSH")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
-    parser.add_argument("--rate", type=float, default=1.0, help="maximum Last.fm requests per second")
+    parser.add_argument("--rate", type=float, default=1.0, help="maximum MusicBrainz/Last.fm requests per second")
     parser.add_argument("--max-backoff", type=float, default=300.0)
     parser.add_argument("--no-local", action="store_true", help="skip local cover art lookup")
+    parser.add_argument("--no-musicbrainz", action="store_true", help="skip MusicBrainz/Cover Art Archive lookup")
     parser.add_argument("--no-lastfm", action="store_true", help="skip Last.fm lookup")
     parser.add_argument("--retry-failures", action="store_true", help="retry albums already listed in failures.json")
+    parser.add_argument("--only-failures", action="store_true", help="hydrate only albums currently listed in failures.json")
     parser.add_argument("--dry-run", action="store_true", help="show what would be hydrated without writing covers")
+    parser.add_argument("--log-file", default=None, help="write progress to this log file; defaults to cache/hydrate.log")
+    parser.add_argument("--no-log", action="store_true", help="disable hydrate progress log")
     return parser.parse_args()
 
 
@@ -80,6 +85,7 @@ def main():
     music_cfg = cfg.get("music", {})
     music_root_arg = args.music_root if args.music_root is not None else music_cfg.get("root", "")
     ssh_host_arg = args.ssh_host if args.ssh_host is not None else music_cfg.get("ssh_host", "")
+    log_path = "" if args.no_log else expand_path(args.log_file or os.path.join(cache_dir, "hydrate.log"))
 
     records = load_records(cfg, playlist=args.playlist)
     index = load_index(cache_dir)
@@ -90,14 +96,20 @@ def main():
     work_items = []
     cached = 0
     skipped_failed = 0
+    failures_changed = False
 
     for library_idx, record in enumerate(records, start=1):
+        failure_id = failure_key(record)
         cover_path = cached_cover_path(cache_dir, record.artist, record.album, album_key=record.key)
         if cover_path:
             cached += 1
+            if failure_id in known_failures:
+                del known_failures[failure_id]
+                failures_changed = True
             continue
-        failure_id = failure_key(record)
-        if not args.retry_failures and failure_id in known_failures:
+        if args.only_failures and failure_id not in known_failures:
+            continue
+        if not args.retry_failures and not args.only_failures and failure_id in known_failures:
             skipped_failed += 1
             continue
         work_items.append((library_idx, record))
@@ -105,13 +117,18 @@ def main():
     if args.limit:
         work_items = work_items[: args.limit]
 
-    print(f"albums: {len(records)}")
-    print(f"cached: {cached}")
-    print(f"known failures skipped: {skipped_failed}")
-    print(f"to hydrate: {len(work_items)}")
-    print(f"cache: {cache_dir}")
-    print(f"local art: {'off' if args.no_local else (ssh_host + ':' + music_root if ssh_host else music_root)}")
-    print(f"lastfm: {'off' if args.no_lastfm else 'max %.3g/sec' % args.rate}")
+    log = HydrateLog(log_path)
+    log.write(f"hydrate started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if log_path:
+        log.write(f"log: {log_path}")
+    log.write(f"albums: {len(records)}")
+    log.write(f"cached: {cached}")
+    log.write(f"known failures skipped: {skipped_failed}")
+    log.write(f"to hydrate: {len(work_items)}")
+    log.write(f"cache: {cache_dir}")
+    log.write(f"local art: {'off' if args.no_local else (ssh_host + ':' + music_root if ssh_host else music_root)}")
+    log.write(f"musicbrainz: {'off' if args.no_musicbrainz else 'on, max %.3g/sec' % args.rate}")
+    log.write(f"lastfm: {'off' if args.no_lastfm else 'on, max %.3g/sec' % args.rate}")
 
     attempted = 0
     written = 0
@@ -123,10 +140,10 @@ def main():
 
         label = f"{record.artist} - {record.album}"
         if args.dry_run:
-            print(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] would hydrate: {label}")
+            log.write(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] would hydrate: {label}")
             continue
 
-        if args.no_lastfm:
+        if args.no_lastfm and args.no_musicbrainz:
             path, source = copy_local_cover(
                 record,
                 cache_dir,
@@ -147,13 +164,20 @@ def main():
                 user_agent=args.user_agent,
                 rate_limiter=limiter,
                 use_imagemagick=use_imagemagick,
+                use_musicbrainz=not args.no_musicbrainz,
+                use_lastfm=not args.no_lastfm,
             )
 
         if path:
             written += 1
+            failure_id = failure_key(record)
+            if failure_id in known_failures:
+                del known_failures[failure_id]
+                failures = list(known_failures.values())
+                failures_changed = True
             update_index_entry(index, record, path, source)
             save_index(cache_dir, index)
-            print(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] {source}: {label}")
+            log.write(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] {source}: {label}")
         else:
             failed += 1
             failure = {
@@ -168,15 +192,39 @@ def main():
             failures = list(known_failures.values())
             if not args.dry_run:
                 save_failures(cache_dir, failures)
-            print(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] failed ({source}): {label}")
+            log.write(f"[{attempt_idx}/{len(work_items)} library {library_idx}/{len(records)}] failed ({source}): {label}")
 
     if not args.dry_run:
         save_index(cache_dir, index)
+        if failures_changed:
+            failures = list(known_failures.values())
         save_failures(cache_dir, failures)
-    print(
+    log.write(
         f"done: cached={cached} skipped_failed={skipped_failed} "
         f"written={written} failed={failed} attempted={attempted}"
     )
+    log.close()
+
+
+class HydrateLog:
+    def __init__(self, path):
+        self.path = path
+        self.file = None
+        if path:
+            ensure_dir(os.path.dirname(path) or ".")
+            self.file = open(path, "a", encoding="utf-8")
+            self.file.write("\n")
+
+    def write(self, message):
+        print(message, flush=True)
+        if self.file is not None:
+            self.file.write(message + "\n")
+            self.file.flush()
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
 
 def path_exists(path):

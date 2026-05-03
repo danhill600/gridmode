@@ -6,6 +6,8 @@ import shlex
 import shutil
 import subprocess
 import time
+from difflib import SequenceMatcher
+from urllib.parse import quote
 from dataclasses import dataclass, field
 
 import mpd
@@ -39,6 +41,8 @@ class AlbumRecord:
     album: str
     key: tuple
     rel_dir: str = ""
+    release_mbid: str = ""
+    release_group_mbid: str = ""
     artists: set = field(default_factory=set)
     has_album_artist: bool = False
 
@@ -164,11 +168,15 @@ def album_records_from_items(items):
 
         if key not in by_key:
             album_artist = _tag_to_str(item.get("albumartist", "")).strip()
+            release_mbid = _tag_to_str(item.get("musicbrainz_albumid", "")).strip()
+            release_group_mbid = _tag_to_str(item.get("musicbrainz_releasegroupid", "")).strip()
             record = AlbumRecord(
                 artist=album_artist or artist,
                 album=album,
                 key=key,
                 rel_dir=_album_dir(item),
+                release_mbid=release_mbid,
+                release_group_mbid=release_group_mbid,
                 artists={artist.casefold()},
                 has_album_artist=bool(album_artist),
             )
@@ -497,6 +505,169 @@ def best_lastfm_image_url(data):
     return ""
 
 
+def release_mbid_from_key(album_key):
+    if not album_key:
+        return ""
+    for part in album_key:
+        if isinstance(part, str) and part.startswith("mbid:"):
+            return part.split(":", 1)[1]
+    return ""
+
+
+def fetch_cover_art_archive_cover(
+    record,
+    cache_dir,
+    size_px,
+    user_agent=DEFAULT_USER_AGENT,
+    rate_limiter=None,
+    use_imagemagick=True,
+):
+    cached_path = cached_cover_path(cache_dir, record.artist, record.album, album_key=record.key)
+    if cached_path:
+        return cached_path, "cache"
+
+    dest_path = get_cover_path(cache_dir, record.artist, record.album, album_key=record.key)
+    headers = {"User-Agent": user_agent}
+
+    release_mbids = unique_values([record.release_mbid, release_mbid_from_key(record.key)])
+    release_group_mbids = unique_values([record.release_group_mbid])
+    for url in cover_art_urls(release_mbids, release_group_mbids):
+        path = download_and_convert_cover(url, dest_path, size_px, headers, use_imagemagick)
+        if path:
+            return path, "coverartarchive"
+
+    releases, reason = search_musicbrainz_releases(record, user_agent=user_agent, rate_limiter=rate_limiter)
+    if not releases:
+        return None, reason
+
+    release_mbids = []
+    release_group_mbids = []
+    for release in releases:
+        release_mbid = release.get("id", "")
+        if release_mbid:
+            release_mbids.append(release_mbid)
+        release_group = release.get("release-group")
+        if isinstance(release_group, dict) and release_group.get("id"):
+            release_group_mbids.append(release_group["id"])
+
+    for url in cover_art_urls(unique_values(release_mbids), unique_values(release_group_mbids)):
+        path = download_and_convert_cover(url, dest_path, size_px, headers, use_imagemagick)
+        if path:
+            return path, "musicbrainz"
+    return None, "no_coverartarchive_url"
+
+
+def unique_values(values):
+    seen = set()
+    out = []
+    for value in values:
+        value = _tag_to_str(value).strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def cover_art_urls(release_mbids, release_group_mbids):
+    for mbid in release_mbids:
+        yield f"https://coverartarchive.org/release/{quote(mbid)}/front-500"
+    for mbid in release_group_mbids:
+        yield f"https://coverartarchive.org/release-group/{quote(mbid)}/front-500"
+
+
+def download_and_convert_cover(url, dest_path, size_px, headers, use_imagemagick):
+    tmp_path = dest_path + ".download"
+    if not download_file(url, tmp_path, headers=headers):
+        remove_quietly(tmp_path)
+        return None
+    if convert_to_png(tmp_path, dest_path, size_px, use_imagemagick):
+        remove_quietly(tmp_path)
+        return dest_path
+    remove_quietly(tmp_path)
+    return None
+
+
+def search_musicbrainz_releases(record, user_agent=DEFAULT_USER_AGENT, rate_limiter=None):
+    queries = [
+        f'artist:"{record.artist}" AND release:"{record.album}"',
+        f'release:"{record.album}"',
+    ]
+    for query in queries:
+        releases, reason = query_musicbrainz_releases(query, record, user_agent=user_agent, rate_limiter=rate_limiter)
+        if releases:
+            return releases, reason
+        if reason not in ("no_musicbrainz_release",):
+            return [], reason
+    return [], "no_musicbrainz_release"
+
+
+def query_musicbrainz_releases(query, record, user_agent=DEFAULT_USER_AGENT, rate_limiter=None):
+    if rate_limiter is not None:
+        rate_limiter.wait()
+
+    headers = {"User-Agent": user_agent}
+    params = {"query": query, "fmt": "json", "limit": 8}
+    try:
+        resp = requests.get("https://musicbrainz.org/ws/2/release/", params=params, headers=headers, timeout=20)
+    except requests.RequestException:
+        if rate_limiter is not None:
+            rate_limiter.failure()
+        return [], "musicbrainz_request_failed"
+
+    if resp.status_code in (429, 503):
+        if rate_limiter is not None:
+            rate_limiter.failure(hard=True)
+        return [], "musicbrainz_rate_limited"
+    if resp.status_code != 200:
+        if rate_limiter is not None:
+            rate_limiter.failure()
+        return [], f"musicbrainz_http_{resp.status_code}"
+
+    if rate_limiter is not None:
+        rate_limiter.success()
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return [], "musicbrainz_bad_json"
+
+    releases = data.get("releases", []) if isinstance(data, dict) else []
+    if not isinstance(releases, list):
+        return [], "no_musicbrainz_release"
+
+    filtered = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        try:
+            score = int(release.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        title = _tag_to_str(release.get("title", ""))
+        if score >= 70 and title_similarity(record.album, title) >= 0.7:
+            filtered.append(release)
+    return filtered, "no_musicbrainz_release"
+
+
+def title_similarity(left, right):
+    left_norm = normalize_title(left)
+    right_norm = normalize_title(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    if left_norm in right_norm or right_norm in left_norm:
+        return 0.85
+    return SequenceMatcher(None, left_norm, right_norm).ratio()
+
+
+def normalize_title(text):
+    text = _tag_to_str(text).casefold()
+    text = re.sub(r"\[[^\]]*\]|\{[^}]*\}|\([^)]*(?:reissue|remaster|bonus|anniversary)[^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def hydrate_cover(
     record,
     cache_dir,
@@ -508,6 +679,8 @@ def hydrate_cover(
     user_agent=DEFAULT_USER_AGENT,
     rate_limiter=None,
     use_imagemagick=True,
+    use_musicbrainz=True,
+    use_lastfm=True,
 ):
     ensure_dir(cache_dir)
     cached_path = cached_cover_path(cache_dir, record.artist, record.album, album_key=record.key)
@@ -518,6 +691,23 @@ def hydrate_cover(
         path, source = copy_local_cover(record, cache_dir, music_root, size_px, use_imagemagick, ssh_host)
         if path:
             return path, source
+
+    musicbrainz_source = "musicbrainz_off"
+    if use_musicbrainz:
+        path, source = fetch_cover_art_archive_cover(
+            record,
+            cache_dir,
+            size_px,
+            user_agent=user_agent,
+            rate_limiter=rate_limiter,
+            use_imagemagick=use_imagemagick,
+        )
+        if path:
+            return path, source
+        musicbrainz_source = source
+
+    if not use_lastfm:
+        return None, musicbrainz_source
 
     return fetch_lastfm_cover(
         record,
@@ -559,6 +749,8 @@ def update_index_entry(index, record, path, source):
         "album": record.album,
         "key": list(record.key),
         "rel_dir": record.rel_dir,
+        "release_mbid": record.release_mbid,
+        "release_group_mbid": record.release_group_mbid,
         "source": source,
         "path": os.path.basename(path) if path else "",
         "updated_at": int(time.time()),
