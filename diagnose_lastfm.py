@@ -3,30 +3,11 @@
 import sys
 import traceback
 
-try:
-    import tomllib
-except Exception:  # pragma: no cover
-    tomllib = None
-
 import pylast
 
+from gridmode_config import load_app_config
+
 DEFAULT_CONFIG = "config.toml"
-
-
-def load_config(path):
-    if tomllib is None:
-        raise RuntimeError("tomllib not available; use Python 3.11+ or add tomli")
-    with open(path, "rb") as f:
-        return tomllib.load(f)
-
-
-def require_cfg(cfg, *keys):
-    cur = cfg
-    for k in keys:
-        if k not in cur:
-            raise KeyError("Missing config: " + ".".join(keys))
-        cur = cur[k]
-    return cur
 
 
 def main():
@@ -34,9 +15,9 @@ def main():
     if len(sys.argv) > 1:
         cfg_path = sys.argv[1]
 
-    cfg = load_config(cfg_path)
-    api_key = require_cfg(cfg, "lastfm", "api_key")
-    api_secret = require_cfg(cfg, "lastfm", "api_secret")
+    cfg = load_app_config(cfg_path)
+    api_key = cfg.lastfm.api_key
+    api_secret = cfg.lastfm.api_secret
 
     if not api_key or not api_secret:
         print("Missing lastfm credentials in config.")

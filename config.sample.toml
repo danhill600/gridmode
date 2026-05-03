@@ -1,5 +1,5 @@
 [mpd]
-# If you use SSH host aliases (e.g. "oblocal"), note those only resolve for SSH.
+# SSH host aliases only resolve for SSH, not for MPD.
 # Use an IP address or a resolvable hostname/FQDN here.
 host = "localhost"
 port = 6600
@@ -12,8 +12,25 @@ api_secret = "YOUR_LASTFM_API_SECRET"
 [cache]
 dir = ".gridmode-cache"
 
+[music]
+# Optional. Set root when local cover lookup or library mtime sorting should read
+# the underlying music directory. Set ssh_host only when that directory is remote.
+root = ""
+ssh_host = ""
+
 [ui]
 columns = 5
 cell_size = 180
 padding = 12
 font = "Helvetica 10"
+top_gap = 4
+title_gap = 4
+row_gap = 8
+max_image_cache = 600
+nowplaying_cover_size = 420
+nowplaying_title_font = "Courier 30 bold"
+nowplaying_text_font = "Courier 17"
+nowplaying_current_font = "Courier 17 bold"
+nowplaying_bio_font = "Courier 17"
+help_font = "Courier 11"
+loading_font = "Courier 18 bold"

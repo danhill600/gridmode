@@ -2,3 +2,5 @@ config.toml
 .gridmode-cache/
 .venv/
 __pycache__/
+.*.swp
+notes/
