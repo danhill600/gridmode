@@ -17,6 +17,16 @@ dir = ".gridmode-cache"
 # the underlying music directory. Set ssh_host only when that directory is remote.
 root = ""
 ssh_host = ""
+# Optional lossy mirror used when sending albums to a phone.
+lossy_root = ""
+prefer_lossy_for_phone = true
+transcode_missing_lossy = false
+
+[phone]
+# Optional. Set enabled=true when an SSH-reachable phone should appear as a tab.
+enabled = false
+ssh_host = ""
+music_root = ""
 
 [ui]
 columns = 5

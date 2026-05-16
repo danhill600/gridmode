@@ -25,6 +25,16 @@ class CacheConfig:
 class MusicConfig:
     root: str = ""
     ssh_host: str = ""
+    lossy_root: str = ""
+    prefer_lossy_for_phone: bool = True
+    transcode_missing_lossy: bool = False
+
+
+@dataclass(frozen=True)
+class PhoneConfig:
+    enabled: bool = False
+    ssh_host: str = ""
+    music_root: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,7 @@ class AppConfig:
     lastfm: LastfmConfig
     cache: CacheConfig
     music: MusicConfig
+    phone: PhoneConfig
     ui: UiConfig
 
 
@@ -65,6 +76,7 @@ def parse_app_config(raw):
     ui = raw.get("ui", {})
     lastfm = raw.get("lastfm", {})
     music = raw.get("music", {})
+    phone = raw.get("phone", {})
 
     errors = []
     host = _string(mpd.get("host"))
@@ -95,6 +107,14 @@ def parse_app_config(raw):
         music=MusicConfig(
             root=_string(music.get("root")),
             ssh_host=_string(music.get("ssh_host")),
+            lossy_root=_string(music.get("lossy_root")),
+            prefer_lossy_for_phone=_bool(music.get("prefer_lossy_for_phone"), True),
+            transcode_missing_lossy=_bool(music.get("transcode_missing_lossy"), False),
+        ),
+        phone=PhoneConfig(
+            enabled=_bool(phone.get("enabled"), False),
+            ssh_host=_string(phone.get("ssh_host")),
+            music_root=_string(phone.get("music_root")),
         ),
         ui=UiConfig(
             columns=columns,
@@ -133,6 +153,14 @@ def config_to_mapping(config):
         "music": {
             "root": config.music.root,
             "ssh_host": config.music.ssh_host,
+            "lossy_root": config.music.lossy_root,
+            "prefer_lossy_for_phone": config.music.prefer_lossy_for_phone,
+            "transcode_missing_lossy": config.music.transcode_missing_lossy,
+        },
+        "phone": {
+            "enabled": config.phone.enabled,
+            "ssh_host": config.phone.ssh_host,
+            "music_root": config.phone.music_root,
         },
         "ui": {
             "columns": config.ui.columns,
@@ -158,6 +186,21 @@ def _string(value, default=""):
     if value is None:
         return default
     return str(value).strip()
+
+
+def _bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    text = str(value).strip().casefold()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 def _int(value, name, errors, min_value=None, max_value=None):

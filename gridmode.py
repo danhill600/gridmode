@@ -29,6 +29,12 @@ from mpd_service import (
     save_current_queue_as_playlist,
     song_playlist_position,
 )
+from phone_service import (
+    copy_local_cover_to_remote_album,
+    copy_remote_album_to_phone,
+    list_phone_album_dirs,
+    prepare_album_for_phone,
+)
 from gridmode_cache import (
     DEFAULT_USER_AGENT,
     Image,
@@ -187,6 +193,8 @@ class GridModeApp:
         self.nowplaying_text_font = tkfont.Font(font=cfg.get("ui", {}).get("nowplaying_text_font", "Courier 17"))
         self.nowplaying_current_font = tkfont.Font(font=cfg.get("ui", {}).get("nowplaying_current_font", "Courier 17 bold"))
         self.nowplaying_bio_font = tkfont.Font(font=cfg.get("ui", {}).get("nowplaying_bio_font", "Courier 17"))
+        self.nowplaying_profile = None
+        self.nowplaying_profiles = self.build_nowplaying_profiles()
         self.help_font = tkfont.Font(font=cfg.get("ui", {}).get("help_font", "Courier 11"))
         self.loading_font = tkfont.Font(font=cfg.get("ui", {}).get("loading_font", "Courier 18 bold"))
         self.selected_index = 0
@@ -206,6 +214,7 @@ class GridModeApp:
         self.mpd_idle_stop = threading.Event()
         self.mpd_idle_thread = None
         self.load_result_queue = queue.Queue()
+        self.phone_transfer_pending = 0
         self.loading_views = set()
         self.loading_after_id = None
         self.loading_frame = 0
@@ -219,9 +228,11 @@ class GridModeApp:
         ensure_dir(self.cache_dir)
 
         self.active_view = "queue"
-        self.view_items = {"queue": [], "library": []}
-        self.view_loaded = {"queue": False, "library": False}
-        self.view_selected_indices = {"queue": 0, "library": 0}
+        self.phone_enabled = bool(cfg.get("phone", {}).get("enabled"))
+        self.grid_views = ["queue", "library"] + (["phone"] if self.phone_enabled else [])
+        self.view_items = {view: [] for view in self.grid_views}
+        self.view_loaded = {view: False for view in self.grid_views}
+        self.view_selected_indices = {view: 0 for view in self.grid_views}
         self.view_grid_cache = {}
         self.pending_leader = None
         self.current_playlist_name = None
@@ -242,11 +253,14 @@ class GridModeApp:
         self.tabs = ttk.Notebook(self.root)
         self.queue_tab = ttk.Frame(self.tabs)
         self.library_tab = ttk.Frame(self.tabs)
+        self.phone_tab = ttk.Frame(self.tabs)
         self.nowplaying_tab = ttk.Frame(self.tabs)
         self.info_tab = ttk.Frame(self.tabs)
         self.help_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.queue_tab, text="Queue")
         self.tabs.add(self.library_tab, text="Library")
+        if self.phone_enabled:
+            self.tabs.add(self.phone_tab, text="Phone")
         self.tabs.add(self.nowplaying_tab, text="Now Playing")
         self.tabs.pack(side="top", fill="x")
 
@@ -289,7 +303,7 @@ class GridModeApp:
         self.help_text.configure(state="disabled")
 
         self.nowplaying_frame = ttk.Frame(self.content, padding=12)
-        title_box_height = self.nowplaying_title_font.metrics("linespace") * 3
+        title_box_height = self.nowplaying_title_box_height()
         self.nowplaying_left = tk.Frame(
             self.nowplaying_frame,
             width=self.nowplaying_cover_size,
@@ -398,9 +412,11 @@ class GridModeApp:
         self.root.bind("1", lambda e: self.switch_tab(0))
         self.root.bind("2", lambda e: self.switch_tab(1))
         self.root.bind("3", lambda e: self.switch_tab(2))
+        self.root.bind("4", lambda e: self.switch_tab(3))
         self.root.bind_all("a", lambda e: self.add_selected_library_album_after_current())
         self.root.bind_all("A", lambda e: self.append_selected_library_album())
         self.root.bind_all("d", lambda e: self.remove_selected_queue_album())
+        self.root.bind_all("p", lambda e: self.send_selected_album_to_phone())
         self.root.bind_all("i", lambda e: self.toggle_info_tab())
         self.root.bind_all("o", lambda e: self.jump_to_current_album())
         self.root.bind_all("?", lambda e: self.show_key_help())
@@ -409,6 +425,7 @@ class GridModeApp:
         self.root.bind("r", lambda e: self.refresh_from_key())
         self.root.bind_all("q", lambda e: self.close_info_or_quit())
         self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        self.root.bind("<Configure>", self.on_root_configure)
 
         self.refresh()
         self.set_fullscreen(True)
@@ -437,6 +454,78 @@ class GridModeApp:
             background=[("selected", APP_BG_SELECTED)],
             foreground=[("selected", APP_FG)],
         )
+
+    def build_nowplaying_profiles(self):
+        base = {
+            "cover": self.nowplaying_cover_size,
+            "title_size": self.nowplaying_title_font.actual("size"),
+            "text_size": self.nowplaying_text_font.actual("size"),
+            "bio_size": self.nowplaying_bio_font.actual("size"),
+        }
+        return {
+            "small": self.scaled_nowplaying_profile(base, 0.76),
+            "medium": self.scaled_nowplaying_profile(base, 0.88),
+            "large": base,
+        }
+
+    def scaled_nowplaying_profile(self, base, scale):
+        return {
+            "cover": max(280, round(base["cover"] * scale)),
+            "title_size": max(18, round(base["title_size"] * scale)),
+            "text_size": max(12, round(base["text_size"] * scale)),
+            "bio_size": max(12, round(base["bio_size"] * scale)),
+        }
+
+    def on_root_configure(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        self.apply_nowplaying_profile_for_size(self.root.winfo_width(), self.root.winfo_height())
+
+    def nowplaying_profile_for_size(self, width, height):
+        if width < 1200 or height < 720:
+            return "small"
+        if width < 1700 or height < 950:
+            return "medium"
+        return "large"
+
+    def apply_nowplaying_profile_for_size(self, width, height):
+        if width <= 1 or height <= 1:
+            return
+        profile_name = self.nowplaying_profile_for_size(width, height)
+        if profile_name == self.nowplaying_profile:
+            return
+        self.nowplaying_profile = profile_name
+        profile = self.nowplaying_profiles[profile_name]
+        self.apply_nowplaying_profile(profile)
+
+    def apply_nowplaying_profile(self, profile):
+        self.nowplaying_cover_size = profile["cover"]
+        self.nowplaying_title_font.configure(size=profile["title_size"])
+        self.nowplaying_text_font.configure(size=profile["text_size"])
+        self.nowplaying_current_font.configure(size=profile["text_size"])
+        self.nowplaying_bio_font.configure(size=profile["bio_size"])
+
+        title_box_height = self.nowplaying_title_box_height()
+        self.nowplaying_left.configure(
+            width=self.nowplaying_cover_size,
+            height=self.nowplaying_cover_size + title_box_height + 10,
+        )
+        self.nowplaying_title_box.configure(width=self.nowplaying_cover_size, height=title_box_height)
+        title_char_width = max(self.nowplaying_title_font.measure("0"), 1)
+        self.nowplaying_title.configure(
+            wraplength=self.nowplaying_cover_size,
+            width=max(1, self.nowplaying_cover_size // title_char_width),
+        )
+        self.nowplaying_title.place_configure(x=self.nowplaying_cover_size // 2)
+        self.track_text.configure(font=self.nowplaying_text_font)
+        self.track_text.tag_configure("current", font=self.nowplaying_current_font)
+        self.bio_text.configure(font=self.nowplaying_bio_font)
+        info = self.current_track_info()
+        if self.active_view in ("nowplaying", "info") and info:
+            self.render_nowplaying(info)
+
+    def nowplaying_title_box_height(self):
+        return self.nowplaying_title_font.metrics("linespace") * 4
 
     def bind_repeating_key(self, key, action, intercept_widgets=()):
         self.root.bind_all(
@@ -564,6 +653,9 @@ class GridModeApp:
         if self.active_view == "library":
             self.start_library_load(rebuild=rebuild)
             return
+        if self.active_view == "phone":
+            self.view_items["phone"] = self.load_phone_items()
+            self.view_loaded["phone"] = True
         else:
             self.view_items["queue"] = self.load_queue_items()
             self.view_loaded["queue"] = True
@@ -643,6 +735,53 @@ class GridModeApp:
                 client.disconnect()
             except Exception:
                 pass
+
+    def load_phone_items(self):
+        phone_cfg = self.cfg.get("phone", {})
+        if not phone_cfg.get("enabled"):
+            return []
+        ssh_host = phone_cfg.get("ssh_host", "")
+        music_root = phone_cfg.get("music_root", "")
+        if not ssh_host or not music_root:
+            self.update_status("phone config missing ssh_host or music_root")
+            return []
+        try:
+            dirs = list_phone_album_dirs(ssh_host, music_root)
+        except Exception as e:
+            logging.exception("Failed to load phone albums")
+            self.update_status(f"phone load error: {e}")
+            return []
+
+        known = self.phone_library_lookup()
+        items = []
+        for entry in dirs:
+            name = str(entry.get("name", ""))
+            rel_dir = str(entry.get("rel_dir", name))
+            item = known.get(rel_dir) or known.get(os.path.basename(rel_dir)) or {
+                "artist": name,
+                "album": "",
+                "key": (name.casefold(), f"phone:{rel_dir.casefold()}"),
+                "rel_dir": rel_dir,
+                "mtime": entry.get("mtime"),
+                "search_text": name.casefold(),
+            }
+            phone_item = dict(item)
+            phone_item["phone_rel_dir"] = rel_dir
+            phone_item["phone_name"] = name
+            phone_item["mtime"] = entry.get("mtime", phone_item.get("mtime"))
+            items.append(phone_item)
+        items.sort(key=lambda item: (-(item.get("mtime") or 0), item.get("artist", "").casefold()))
+        return items
+
+    def phone_library_lookup(self):
+        lookup = {}
+        for item in self.load_library_index():
+            rel_dir = item.get("rel_dir", "")
+            if not rel_dir:
+                continue
+            lookup[rel_dir] = item
+            lookup.setdefault(os.path.basename(rel_dir), item)
+        return lookup
 
     def load_library_items(self, rebuild=False):
         cached_items = self.load_library_index()
@@ -785,7 +924,12 @@ json.dump(out, sys.stdout)
             self.show_help_panel()
             self.update_status()
             return
-        self.active_view = "library" if tab_text == "Library" else "queue"
+        if tab_text == "Library":
+            self.active_view = "library"
+        elif tab_text == "Phone":
+            self.active_view = "phone"
+        else:
+            self.active_view = "queue"
         self.show_grid_panel()
         if not self.view_loaded[self.active_view]:
             if self.active_view == "library":
@@ -837,7 +981,7 @@ json.dump(out, sys.stdout)
         return "break"
 
     def view_tab_index(self, view):
-        labels = {"queue": "Queue", "library": "Library", "nowplaying": "Now Playing", "info": "Info"}
+        labels = {"queue": "Queue", "library": "Library", "phone": "Phone", "nowplaying": "Now Playing", "info": "Info"}
         wanted = labels.get(view)
         if wanted is None:
             return None
@@ -913,8 +1057,10 @@ json.dump(out, sys.stdout)
             handled = True
             if result.get("view") == "library":
                 self.finish_library_load(result)
+            elif result.get("view") == "phone_transfer":
+                self.finish_phone_transfer(result)
 
-        if self.loading_views:
+        if self.loading_views or self.phone_transfer_pending:
             self.root.after(100, self.poll_load_results)
         elif handled:
             self.stop_loading_animation()
@@ -1199,7 +1345,7 @@ json.dump(out, sys.stdout)
             msg += " | ? or q=close help"
             self.status.configure(text=msg)
             return
-        view = "Library" if self.active_view == "library" else "Queue"
+        view = {"queue": "Queue", "library": "Library", "phone": "Phone"}.get(self.active_view, self.active_view.title())
         msg = f"{view}: {len(self.albums)} albums | covers cached {self.covers_ok}, missing {self.covers_failed}"
         if self.active_view == "library":
             dated = sum(1 for item in self.active_items() if item.get("mtime") is not None)
@@ -1212,7 +1358,7 @@ json.dump(out, sys.stdout)
             msg += " | no ImageMagick"
         if note:
             msg += f" | {note}"
-        msg += " | 1/2/3 tabs, Enter=add/select, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh, q=quit"
+        msg += " | 1/2/3/4 tabs, Enter=add/select, p=send to phone, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh, q=quit"
         self.status.configure(text=msg)
 
     def set_fullscreen(self, enabled):
@@ -1238,7 +1384,7 @@ json.dump(out, sys.stdout)
         if self.active_view == "help":
             self.close_key_help()
             return "break"
-        self.help_return_view = self.active_view if self.active_view in ("queue", "library", "nowplaying", "info") else "queue"
+        self.help_return_view = self.active_view if self.active_view in (*self.grid_views, "nowplaying", "info") else "queue"
         if not self.help_tab_visible:
             self.tabs.add(self.help_tab, text="Help")
             self.help_tab_visible = True
@@ -1246,7 +1392,7 @@ json.dump(out, sys.stdout)
         return "break"
 
     def handle_g_key(self):
-        if self.active_view not in ("queue", "library"):
+        if self.active_view not in self.grid_views:
             return "break"
         if self.pending_leader == "g":
             self.pending_leader = None
@@ -1257,7 +1403,7 @@ json.dump(out, sys.stdout)
 
     def jump_grid_position(self, where):
         self.pending_leader = None
-        if self.active_view not in ("queue", "library") or not self.albums:
+        if self.active_view not in self.grid_views or not self.albums:
             return "break"
         if where == "top":
             idx = 0
@@ -1349,7 +1495,7 @@ json.dump(out, sys.stdout)
         self.update_status(f"search {self.library_search_matches.index(idx) + 1}/{len(matches)}: {self.library_search_query}")
 
     def close_key_help(self):
-        return_view = self.help_return_view if self.help_return_view in ("queue", "library", "nowplaying", "info") else "queue"
+        return_view = self.help_return_view if self.help_return_view in (*self.grid_views, "nowplaying", "info") else "queue"
         if self.help_tab_visible:
             self.tabs.hide(self.help_tab)
             self.help_tab_visible = False
@@ -1436,7 +1582,7 @@ json.dump(out, sys.stdout)
         self.render_visible()
 
     def move_selection(self, dx, dy):
-        if self.active_view not in ("queue", "library"):
+        if self.active_view not in self.grid_views:
             return
         if not self.albums:
             return
@@ -1530,7 +1676,7 @@ json.dump(out, sys.stdout)
         self.track_text.configure(state="disabled")
 
     def page_scroll(self, direction):
-        if self.active_view not in ("queue", "library"):
+        if self.active_view not in self.grid_views:
             return
         if not self.albums:
             return
@@ -1691,7 +1837,7 @@ json.dump(out, sys.stdout)
         return "break"
 
     def close_info_tab(self):
-        return_view = self.info_return_view if self.info_return_view in ("queue", "library") else "queue"
+        return_view = self.info_return_view if self.info_return_view in self.grid_views else "queue"
         if self.info_tab_visible:
             self.tabs.hide(self.info_tab)
             self.info_tab_visible = False
@@ -2044,6 +2190,9 @@ json.dump(out, sys.stdout)
         if self.active_view == "library":
             self.add_library_album_after_current_album(item, play=True)
             return "break"
+        if self.active_view == "phone":
+            self.update_status(f"on phone: {item.get('artist', '')} - {item.get('album', '')}".rstrip(" -"))
+            return "break"
         self.play_selected_queue_album(item)
         return "break"
 
@@ -2069,6 +2218,103 @@ json.dump(out, sys.stdout)
             return "break"
         self.append_library_album_to_playlist(item)
         return "break"
+
+    def selected_album_for_phone(self):
+        if self.active_view in ("queue", "library") and self.albums:
+            return dict(self.active_items()[self.selected_index])
+        if self.active_view == "info" and self.info_info:
+            return dict(self.info_info)
+        if self.active_view == "nowplaying":
+            if not self.nowplaying_info:
+                self.refresh_nowplaying()
+            if self.nowplaying_info:
+                return dict(self.nowplaying_info)
+        return None
+
+    def send_selected_album_to_phone(self):
+        if self.active_view == "help":
+            return "break"
+        item = self.selected_album_for_phone()
+        if item is None:
+            return "break"
+        phone_cfg = self.cfg.get("phone", {})
+        if not phone_cfg.get("enabled"):
+            self.update_status("phone is not enabled")
+            return "break"
+        if not phone_cfg.get("ssh_host") or not phone_cfg.get("music_root"):
+            self.update_status("phone config missing ssh_host or music_root")
+            return "break"
+        if not item.get("rel_dir"):
+            self.update_status("selected album has no source directory")
+            return "break"
+
+        self.phone_transfer_pending += 1
+        self.update_status(f"sending to phone: {item.get('artist', '')} - {item.get('album', '')}".rstrip(" -"))
+        thread = threading.Thread(target=self.phone_transfer_worker, args=(item,), daemon=True)
+        thread.start()
+        self.root.after(100, self.poll_load_results)
+        return "break"
+
+    def phone_transfer_worker(self, item):
+        try:
+            music_cfg = self.cfg.get("music", {})
+            phone_cfg = self.cfg.get("phone", {})
+            prepared = prepare_album_for_phone(
+                music_cfg.get("ssh_host", ""),
+                music_cfg.get("root", ""),
+                item.get("rel_dir", ""),
+                lossy_root=music_cfg.get("lossy_root", ""),
+                prefer_lossy=music_cfg.get("prefer_lossy_for_phone", True),
+                transcode_missing=music_cfg.get("transcode_missing_lossy", False),
+            )
+            cover_path = self.cached_cover_path_from_lookup(
+                self.cover_file_lookup(),
+                item.get("artist", ""),
+                item.get("album", ""),
+                item.get("key"),
+            )
+            cover_copied = copy_local_cover_to_remote_album(
+                cover_path,
+                music_cfg.get("ssh_host", ""),
+                prepared["path"],
+            )
+            copied = copy_remote_album_to_phone(
+                music_cfg.get("ssh_host", ""),
+                prepared["path"],
+                phone_cfg.get("ssh_host", ""),
+                phone_cfg.get("music_root", ""),
+            )
+            self.load_result_queue.put(
+                {
+                    "view": "phone_transfer",
+                    "item": item,
+                    "prepared": prepared,
+                    "copied": copied,
+                    "cover_copied": cover_copied,
+                    "error": None,
+                }
+            )
+        except Exception as e:
+            logging.exception("Failed to send album to phone")
+            self.load_result_queue.put({"view": "phone_transfer", "item": item, "error": e})
+
+    def finish_phone_transfer(self, result):
+        self.phone_transfer_pending = max(0, self.phone_transfer_pending - 1)
+        error = result.get("error")
+        item = result.get("item") or {}
+        if error is not None:
+            self.update_status(f"phone send error: {error}")
+            return
+        prepared = result.get("prepared") or {}
+        copied = result.get("copied") or {}
+        self.view_loaded["phone"] = False
+        self.view_grid_cache.pop("phone", None)
+        kind = prepared.get("kind", "album")
+        created = ", transcoded" if prepared.get("created") else ""
+        cover = ", cover" if result.get("cover_copied") else ""
+        self.update_status(
+            f"sent {kind}{created}{cover}: {item.get('artist', '')} - {item.get('album', '')} -> {copied.get('name', 'phone')}".rstrip(" -")
+        )
 
     def save_current_playlist(self):
         if self.active_view != "queue":
@@ -2440,7 +2686,7 @@ json.dump(out, sys.stdout)
         self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
 
     def on_mousewheel(self, event):
-        if self.active_view not in ("queue", "library"):
+        if self.active_view not in self.grid_views:
             return
         if event.num == 4:
             self.canvas.yview_scroll(-3, "units")
