@@ -51,6 +51,11 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
+Optional system tools:
+
+- `convert` from ImageMagick, or Pillow through Python, for resizing covers.
+- `rsync` on any machine that participates in phone transfers.
+
 Create a local config:
 
 ```sh
@@ -85,6 +90,62 @@ Optional sections:
 If `music.ssh_host` is set, it should be an SSH host alias or hostname that can
 read `music.root`.
 
+## Phone Transfer
+
+Gridmode can treat an SSH-reachable phone as a fourth album grid and can send
+the selected album to it with `p`. This is optional and currently reflects a
+specific but useful setup:
+
+- MPD can be local or remote.
+- The full music library lives on a machine reachable over SSH.
+- A lossy mirror may live beside that library.
+- The phone runs an SSH server, for example Termux `sshd`.
+- The phone exposes a writable music directory such as
+  `/storage/emulated/0/Android/media/lifeboat`.
+
+The relevant config shape is:
+
+```toml
+[music]
+root = "/path/to/full/music"
+ssh_host = "music-host"
+lossy_root = "/path/to/lossy/music"
+prefer_lossy_for_phone = true
+transcode_missing_lossy = false
+
+[phone]
+enabled = true
+ssh_host = "phone"
+music_root = "/storage/emulated/0/Android/media/lifeboat"
+```
+
+`music.ssh_host` and `phone.ssh_host` are SSH aliases or hostnames. They are
+used by SSH commands, not by MPD. For a Termux phone, an SSH config entry often
+looks like a host alias pointing at the phone's LAN address and port `8022`.
+
+Phone transfer dependencies:
+
+- The machine named by `music.ssh_host` needs `ssh`, `rsync`, Python 3, and
+  `ffmpeg` if `transcode_missing_lossy = true`.
+- The phone needs an SSH server running and `rsync` installed. In Termux:
+
+```sh
+pkg install openssh rsync
+sshd
+```
+
+When you press `p`, Gridmode prepares the album on the music host, prefers the
+lossy mirror when configured, optionally transcodes missing lossy copies, copies
+cached cover art into the prepared album as `cover.png`, then runs `rsync` to
+the phone. The transfer popup shows progress, success, cancellation, or the
+actual SSH/rsync error.
+
+The Phone tab lists directories under `phone.music_root`. It does not read cover
+art from the phone. Instead, it matches phone folder names back to the local
+library index and then uses Gridmode's local cover cache. Exact folder matches
+win, with a fallback that tolerates common suffix differences like years,
+labels, `[WEB FLAC]`, and other format markers.
+
 ## Cover Hydration
 
 Hydrate missing album covers:
@@ -113,6 +174,7 @@ is written to `hydrate.log` in the configured cache directory by default; use
 ## Current Keys
 
 - `1`, `2`, `3`: Queue, Library, Now Playing tabs.
+- `p`: send selected Queue, Library, Now Playing, or Info album to the phone.
 - `h`, `j`, `k`, `l`: move around cover grids.
 - `J`, `K`: page movement in grids; track/bio focus in detail views.
 - `Enter`: play/select current item.

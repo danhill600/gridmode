@@ -17,15 +17,22 @@ dir = ".gridmode-cache"
 # the underlying music directory. Set ssh_host only when that directory is remote.
 root = ""
 ssh_host = ""
-# Optional lossy mirror used when sending albums to a phone.
+# Optional lossy mirror used when sending albums to a phone. If
+# prefer_lossy_for_phone=true, Gridmode sends this copy instead of the full
+# source album when it exists. If transcode_missing_lossy=true, the remote music
+# host needs ffmpeg so Gridmode can create missing MP3 mirrors from FLAC files.
 lossy_root = ""
 prefer_lossy_for_phone = true
 transcode_missing_lossy = false
 
 [phone]
-# Optional. Set enabled=true when an SSH-reachable phone should appear as a tab.
+# Optional. Set enabled=true when an SSH-reachable phone should appear as a tab
+# and selected albums should be sendable with "p". The phone and the music host
+# both need rsync for transfers. Termux phones usually need openssh + rsync and
+# an ssh_host alias that points at port 8022.
 enabled = false
 ssh_host = ""
+# Example Android/Termux target: "/storage/emulated/0/Android/media/lifeboat"
 music_root = ""
 
 [ui]
