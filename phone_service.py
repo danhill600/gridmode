@@ -17,7 +17,14 @@ AUDIO_EXTENSIONS = (
 )
 
 
-def list_phone_album_dirs(ssh_host, music_root, timeout=30):
+def list_phone_album_dirs(transfer_ssh_host, phone_ssh_host, phone_root, timeout=30):
+    if not transfer_ssh_host:
+        raise ValueError("phone listing requires music.ssh_host")
+    if not phone_ssh_host:
+        raise ValueError("phone listing requires phone.ssh_host")
+    if not phone_root:
+        raise ValueError("phone listing requires phone.music_root")
+
     script = r"""
 root=$1
 for d in "$root"/*; do
@@ -28,8 +35,16 @@ for d in "$root"/*; do
     printf '%s\t%s\n' "$mtime" "$name"
 done
 """
+    phone_cmd = "sh -c {} gridmode-list-phone {}".format(
+        shlex.quote(script),
+        shlex.quote(phone_root),
+    )
+    transfer_cmd = "ssh -o BatchMode=yes {} {}".format(
+        shlex.quote(phone_ssh_host),
+        shlex.quote(phone_cmd),
+    )
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", ssh_host, "sh -c " + shlex.quote(script) + " gridmode-list-phone " + shlex.quote(music_root)],
+        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -160,9 +175,9 @@ result(lossy, "lossy", created=True)
     return json.loads(proc.stdout)
 
 
-def copy_remote_album_to_phone(source_ssh_host, source_dir, phone_ssh_host, phone_root, timeout=900):
-    if not source_ssh_host:
-        raise ValueError("source ssh host is required")
+def copy_remote_album_to_phone(transfer_ssh_host, source_dir, phone_ssh_host, phone_root, timeout=900):
+    if not transfer_ssh_host:
+        raise ValueError("transfer ssh host is required")
     if not source_dir:
         raise ValueError("source directory is required")
     if not phone_ssh_host:
@@ -170,42 +185,29 @@ def copy_remote_album_to_phone(source_ssh_host, source_dir, phone_ssh_host, phon
     if not phone_root:
         raise ValueError("phone music_root is required")
 
-    parent = posixpath.dirname(source_dir.rstrip("/"))
-    leaf = posixpath.basename(source_dir.rstrip("/"))
-    if not parent or not leaf:
+    leaf = source_dir.rstrip("/").rsplit("/", 1)[-1]
+    if not leaf:
         raise ValueError("bad source directory")
 
-    source_cmd = "tar -C {} -cf - {}".format(shlex.quote(parent), shlex.quote(leaf))
-    dest_cmd = "mkdir -p {} && tar -C {} -xf -".format(shlex.quote(phone_root), shlex.quote(phone_root))
-
-    source_proc = subprocess.Popen(
-        ["ssh", "-o", "BatchMode=yes", source_ssh_host, source_cmd],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    source_arg = source_dir.rstrip("/") + "/"
+    dest_arg = f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}/"
+    mkdir_cmd = "mkdir -p " + shlex.quote(phone_root)
+    cmd = "ssh -o BatchMode=yes {} {} && rsync -a --delete {} {}".format(
+        shlex.quote(phone_ssh_host),
+        shlex.quote(mkdir_cmd),
+        shlex.quote(source_arg),
+        shlex.quote(dest_arg),
     )
-    try:
-        dest_proc = subprocess.Popen(
-            ["ssh", "-o", "BatchMode=yes", phone_ssh_host, dest_cmd],
-            stdin=source_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if source_proc.stdout is not None:
-            source_proc.stdout.close()
-        dest_stdout, dest_stderr = dest_proc.communicate(timeout=timeout)
-        source_stderr = source_proc.stderr.read() if source_proc.stderr else b""
-        source_returncode = source_proc.wait(timeout=30)
-    except Exception:
-        source_proc.kill()
-        raise
-
-    if source_returncode != 0:
-        raise RuntimeError(source_stderr.decode("utf-8", "replace").strip() or f"source ssh exited {source_returncode}")
-    if dest_proc.returncode != 0:
-        stderr = dest_stderr.decode("utf-8", "replace").strip()
-        stdout = dest_stdout.decode("utf-8", "replace").strip()
-        raise RuntimeError(stderr or stdout or f"phone ssh exited {dest_proc.returncode}")
-    return {"name": leaf, "destination": posixpath.join(phone_root.rstrip("/"), leaf)}
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, cmd],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"rsync exited {proc.returncode}")
+    return {"name": leaf, "destination": f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}"}
 
 
 def copy_local_cover_to_remote_album(local_cover_path, remote_ssh_host, remote_album_dir, timeout=60):

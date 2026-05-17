@@ -738,6 +738,7 @@ class GridModeApp:
 
     def load_phone_items(self):
         phone_cfg = self.cfg.get("phone", {})
+        music_cfg = self.cfg.get("music", {})
         if not phone_cfg.get("enabled"):
             return []
         ssh_host = phone_cfg.get("ssh_host", "")
@@ -746,7 +747,7 @@ class GridModeApp:
             self.update_status("phone config missing ssh_host or music_root")
             return []
         try:
-            dirs = list_phone_album_dirs(ssh_host, music_root)
+            dirs = list_phone_album_dirs(music_cfg.get("ssh_host", ""), ssh_host, music_root)
         except Exception as e:
             logging.exception("Failed to load phone albums")
             self.update_status(f"phone load error: {e}")
