@@ -3,6 +3,7 @@ import os
 import posixpath
 import shlex
 import subprocess
+import time
 
 
 AUDIO_EXTENSIONS = (
@@ -15,6 +16,43 @@ AUDIO_EXTENSIONS = (
     ".aiff",
     ".aif",
 )
+
+
+class PhoneTransferCancelled(RuntimeError):
+    pass
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise PhoneTransferCancelled("phone send cancelled")
+
+
+def _run_cancelable(cmd, timeout, cancel_event=None, **kwargs):
+    _check_cancel(cancel_event)
+    input_data = kwargs.pop("input", None)
+    if input_data is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    proc = subprocess.Popen(cmd, **kwargs)
+    started_at = time.monotonic()
+    while True:
+        try:
+            _check_cancel(cancel_event)
+            stdout, stderr = proc.communicate(input=input_data, timeout=0.2)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            input_data = None
+            if timeout is not None and time.monotonic() - started_at > timeout:
+                proc.kill()
+                proc.communicate()
+                raise TimeoutError(f"command timed out after {timeout}s")
+        except PhoneTransferCancelled:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+            raise
 
 
 def list_phone_album_dirs(transfer_ssh_host, phone_ssh_host, phone_root, timeout=30):
@@ -74,6 +112,7 @@ def prepare_album_for_phone(
     prefer_lossy=True,
     transcode_missing=False,
     timeout=900,
+    cancel_event=None,
 ):
     if not music_ssh_host:
         raise ValueError("phone transfer requires music.ssh_host")
@@ -162,20 +201,29 @@ if converted == 0 and copied == 0:
 
 result(lossy, "lossy", created=True)
 """
-    proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", music_ssh_host, "python3 -c " + shlex.quote(script)],
+    cmd = ["ssh", "-o", "BatchMode=yes", music_ssh_host, "python3 -c " + shlex.quote(script)]
+    proc = _run_cancelable(
+        cmd,
+        timeout,
+        cancel_event,
         input=json.dumps(payload),
         text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"ssh exited {proc.returncode}")
     return json.loads(proc.stdout)
 
 
-def copy_remote_album_to_phone(transfer_ssh_host, source_dir, phone_ssh_host, phone_root, timeout=900):
+def copy_remote_album_to_phone(
+    transfer_ssh_host,
+    source_dir,
+    phone_ssh_host,
+    phone_root,
+    timeout=900,
+    cancel_event=None,
+):
     if not transfer_ssh_host:
         raise ValueError("transfer ssh host is required")
     if not source_dir:
@@ -192,25 +240,33 @@ def copy_remote_album_to_phone(transfer_ssh_host, source_dir, phone_ssh_host, ph
     source_arg = source_dir.rstrip("/") + "/"
     dest_arg = f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}/"
     mkdir_cmd = "mkdir -p " + shlex.quote(phone_root)
-    cmd = "ssh -o BatchMode=yes {} {} && rsync -a --delete {} {}".format(
+    cmd_text = "ssh -o BatchMode=yes {} {} && rsync -a --delete {} {}".format(
         shlex.quote(phone_ssh_host),
         shlex.quote(mkdir_cmd),
         shlex.quote(source_arg),
         shlex.quote(dest_arg),
     )
-    proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, cmd],
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, cmd_text]
+    proc = _run_cancelable(
+        cmd,
+        timeout,
+        cancel_event,
         text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"rsync exited {proc.returncode}")
     return {"name": leaf, "destination": f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}"}
 
 
-def copy_local_cover_to_remote_album(local_cover_path, remote_ssh_host, remote_album_dir, timeout=60):
+def copy_local_cover_to_remote_album(
+    local_cover_path,
+    remote_ssh_host,
+    remote_album_dir,
+    timeout=60,
+    cancel_event=None,
+):
     if not local_cover_path or not os.path.exists(local_cover_path):
         return False
     if not remote_ssh_host or not remote_album_dir:
@@ -218,13 +274,13 @@ def copy_local_cover_to_remote_album(local_cover_path, remote_ssh_host, remote_a
 
     dest = posixpath.join(remote_album_dir.rstrip("/"), "cover.png")
     with open(local_cover_path, "rb") as cover:
-        proc = subprocess.run(
+        proc = _run_cancelable(
             ["ssh", "-o", "BatchMode=yes", remote_ssh_host, "cat > " + shlex.quote(dest)],
+            timeout,
+            cancel_event,
             stdin=cover,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
         )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", "replace").strip() or f"cover copy exited {proc.returncode}")

@@ -33,6 +33,7 @@ from phone_service import (
     copy_local_cover_to_remote_album,
     copy_remote_album_to_phone,
     list_phone_album_dirs,
+    PhoneTransferCancelled,
     prepare_album_for_phone,
 )
 from gridmode_cache import (
@@ -110,6 +111,17 @@ def album_item(record, mtime=None):
         "mtime": mtime,
         "search_text": f"{record.artist} {record.album}".casefold(),
     }
+
+
+def phone_folder_match_key(name):
+    name = os.path.basename(str(name or ""))
+    name = re.sub(r"\[[^\]]*\]", " ", name)
+    name = re.sub(r"\{[^}]*\}", " ", name)
+    name = re.sub(r"\((?:19|20)\d{2}[^)]*\)", " ", name)
+    name = re.sub(r"\b(?:19|20)\d{2}\b", " ", name)
+    name = re.sub(r"\b(?:web|cd|vinyl|flac|mp3|lossy|v0|vbr|320|24bit|16bit)\b", " ", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^0-9a-zA-Z]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip().casefold()
 
 
 def release_year_from_song(song):
@@ -215,6 +227,17 @@ class GridModeApp:
         self.mpd_idle_thread = None
         self.load_result_queue = queue.Queue()
         self.phone_transfer_pending = 0
+        self.phone_transfer_cancel_event = None
+        self.phone_transfer_dialog = None
+        self.phone_transfer_phase_var = None
+        self.phone_transfer_detail_var = None
+        self.phone_transfer_elapsed_var = None
+        self.phone_transfer_cancel_button = None
+        self.phone_transfer_close_button = None
+        self.phone_transfer_phone_button = None
+        self.phone_transfer_started_at = None
+        self.phone_transfer_done = False
+        self.phone_transfer_elapsed_after_id = None
         self.loading_views = set()
         self.loading_after_id = None
         self.loading_frame = 0
@@ -758,14 +781,20 @@ class GridModeApp:
         for entry in dirs:
             name = str(entry.get("name", ""))
             rel_dir = str(entry.get("rel_dir", name))
-            item = known.get(rel_dir) or known.get(os.path.basename(rel_dir)) or {
-                "artist": name,
-                "album": "",
-                "key": (name.casefold(), f"phone:{rel_dir.casefold()}"),
-                "rel_dir": rel_dir,
-                "mtime": entry.get("mtime"),
-                "search_text": name.casefold(),
-            }
+            item = (
+                known.get(rel_dir)
+                or known.get(os.path.basename(rel_dir))
+                or known.get(phone_folder_match_key(rel_dir))
+                or known.get(phone_folder_match_key(name))
+                or {
+                    "artist": name,
+                    "album": "",
+                    "key": (name.casefold(), f"phone:{rel_dir.casefold()}"),
+                    "rel_dir": rel_dir,
+                    "mtime": entry.get("mtime"),
+                    "search_text": name.casefold(),
+                }
+            )
             phone_item = dict(item)
             phone_item["phone_rel_dir"] = rel_dir
             phone_item["phone_name"] = name
@@ -782,6 +811,9 @@ class GridModeApp:
                 continue
             lookup[rel_dir] = item
             lookup.setdefault(os.path.basename(rel_dir), item)
+            normalized = phone_folder_match_key(rel_dir)
+            if normalized:
+                lookup.setdefault(normalized, item)
         return lookup
 
     def load_library_items(self, rebuild=False):
@@ -1058,6 +1090,8 @@ json.dump(out, sys.stdout)
             handled = True
             if result.get("view") == "library":
                 self.finish_library_load(result)
+            elif result.get("view") == "phone_transfer_progress":
+                self.update_phone_transfer_dialog(result.get("phase", "Sending to phone..."))
             elif result.get("view") == "phone_transfer":
                 self.finish_phone_transfer(result)
 
@@ -2232,11 +2266,120 @@ json.dump(out, sys.stdout)
                 return dict(self.nowplaying_info)
         return None
 
+    def show_phone_transfer_dialog(self, item):
+        if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
+            self.phone_transfer_dialog.lift()
+            return
+
+        artist = item.get("artist", "")
+        album = item.get("album", "")
+        title = f"{artist} - {album}".strip(" -") or item.get("rel_dir", "selected album")
+        self.phone_transfer_phase_var = tk.StringVar(value="Starting phone send")
+        self.phone_transfer_detail_var = tk.StringVar(value=title)
+        self.phone_transfer_elapsed_var = tk.StringVar(value="Elapsed 0s")
+        self.phone_transfer_done = False
+        self.phone_transfer_started_at = time.monotonic()
+
+        dialog = tk.Toplevel(self.root)
+        self.phone_transfer_dialog = dialog
+        dialog.title("Sending to Phone")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(bg=APP_BG)
+        dialog.protocol("WM_DELETE_WINDOW", self.cancel_or_close_phone_transfer_dialog)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Sending to phone", font=self.nowplaying_title_font).pack(anchor="w")
+        ttk.Label(frame, textvariable=self.phone_transfer_detail_var, wraplength=520).pack(anchor="w", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.phone_transfer_phase_var, wraplength=520).pack(anchor="w", pady=(12, 0))
+        ttk.Label(frame, textvariable=self.phone_transfer_elapsed_var).pack(anchor="w", pady=(4, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(16, 0))
+        self.phone_transfer_phone_button = ttk.Button(buttons, text="Phone Tab", command=self.finish_phone_transfer_and_show_phone)
+        self.phone_transfer_phone_button.pack(side="left")
+        self.phone_transfer_phone_button.configure(state="disabled")
+        self.phone_transfer_cancel_button = ttk.Button(buttons, text="Cancel", command=self.cancel_phone_transfer)
+        self.phone_transfer_cancel_button.pack(side="right")
+        self.phone_transfer_close_button = ttk.Button(buttons, text="Close", command=self.close_phone_transfer_dialog)
+        self.phone_transfer_close_button.pack(side="right", padx=(0, 8))
+        self.phone_transfer_close_button.configure(state="disabled")
+
+        self.update_phone_transfer_elapsed()
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 3)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.lift()
+
+    def update_phone_transfer_elapsed(self):
+        if self.phone_transfer_dialog is None or not self.phone_transfer_dialog.winfo_exists():
+            self.phone_transfer_elapsed_after_id = None
+            return
+        if self.phone_transfer_started_at is not None and self.phone_transfer_elapsed_var is not None:
+            elapsed = int(time.monotonic() - self.phone_transfer_started_at)
+            self.phone_transfer_elapsed_var.set(f"Elapsed {elapsed}s")
+        if not self.phone_transfer_done:
+            self.phone_transfer_elapsed_after_id = self.root.after(500, self.update_phone_transfer_elapsed)
+        else:
+            self.phone_transfer_elapsed_after_id = None
+
+    def update_phone_transfer_dialog(self, phase, detail=None):
+        if self.phone_transfer_phase_var is not None:
+            self.phone_transfer_phase_var.set(phase)
+        if detail and self.phone_transfer_detail_var is not None:
+            self.phone_transfer_detail_var.set(detail)
+        self.update_status(phase.lower())
+
+    def complete_phone_transfer_dialog(self, phase, detail=None, success=False):
+        self.phone_transfer_done = True
+        self.update_phone_transfer_dialog(phase, detail)
+        if self.phone_transfer_cancel_button is not None:
+            self.phone_transfer_cancel_button.configure(state="disabled")
+        if self.phone_transfer_close_button is not None:
+            self.phone_transfer_close_button.configure(state="normal")
+        if success and self.phone_transfer_phone_button is not None:
+            self.phone_transfer_phone_button.configure(state="normal")
+
+    def cancel_or_close_phone_transfer_dialog(self):
+        if self.phone_transfer_done:
+            self.close_phone_transfer_dialog()
+        else:
+            self.cancel_phone_transfer()
+
+    def cancel_phone_transfer(self):
+        if self.phone_transfer_done:
+            return
+        if self.phone_transfer_cancel_event is not None:
+            self.phone_transfer_cancel_event.set()
+        if self.phone_transfer_cancel_button is not None:
+            self.phone_transfer_cancel_button.configure(state="disabled")
+        self.update_phone_transfer_dialog("Cancelling phone send...")
+
+    def close_phone_transfer_dialog(self):
+        if self.phone_transfer_elapsed_after_id is not None:
+            self.root.after_cancel(self.phone_transfer_elapsed_after_id)
+            self.phone_transfer_elapsed_after_id = None
+        if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
+            self.phone_transfer_dialog.destroy()
+        self.phone_transfer_dialog = None
+
+    def finish_phone_transfer_and_show_phone(self):
+        self.close_phone_transfer_dialog()
+        if "phone" in self.grid_views:
+            self.switch_tab(self.grid_views.index("phone"))
+
     def send_selected_album_to_phone(self):
         if self.active_view == "help":
             return "break"
         item = self.selected_album_for_phone()
         if item is None:
+            return "break"
+        if self.phone_transfer_pending:
+            self.update_status("phone send already in progress")
+            if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
+                self.phone_transfer_dialog.lift()
             return "break"
         phone_cfg = self.cfg.get("phone", {})
         if not phone_cfg.get("enabled"):
@@ -2250,16 +2393,22 @@ json.dump(out, sys.stdout)
             return "break"
 
         self.phone_transfer_pending += 1
+        self.phone_transfer_cancel_event = threading.Event()
+        self.show_phone_transfer_dialog(item)
         self.update_status(f"sending to phone: {item.get('artist', '')} - {item.get('album', '')}".rstrip(" -"))
-        thread = threading.Thread(target=self.phone_transfer_worker, args=(item,), daemon=True)
+        thread = threading.Thread(target=self.phone_transfer_worker, args=(item, self.phone_transfer_cancel_event), daemon=True)
         thread.start()
         self.root.after(100, self.poll_load_results)
         return "break"
 
-    def phone_transfer_worker(self, item):
+    def phone_transfer_worker(self, item, cancel_event):
+        def progress(phase):
+            self.load_result_queue.put({"view": "phone_transfer_progress", "phase": phase})
+
         try:
             music_cfg = self.cfg.get("music", {})
             phone_cfg = self.cfg.get("phone", {})
+            progress("Preparing album for phone...")
             prepared = prepare_album_for_phone(
                 music_cfg.get("ssh_host", ""),
                 music_cfg.get("root", ""),
@@ -2267,7 +2416,9 @@ json.dump(out, sys.stdout)
                 lossy_root=music_cfg.get("lossy_root", ""),
                 prefer_lossy=music_cfg.get("prefer_lossy_for_phone", True),
                 transcode_missing=music_cfg.get("transcode_missing_lossy", False),
+                cancel_event=cancel_event,
             )
+            progress("Copying cover art...")
             cover_path = self.cached_cover_path_from_lookup(
                 self.cover_file_lookup(),
                 item.get("artist", ""),
@@ -2278,12 +2429,15 @@ json.dump(out, sys.stdout)
                 cover_path,
                 music_cfg.get("ssh_host", ""),
                 prepared["path"],
+                cancel_event=cancel_event,
             )
+            progress("Copying album to phone...")
             copied = copy_remote_album_to_phone(
                 music_cfg.get("ssh_host", ""),
                 prepared["path"],
                 phone_cfg.get("ssh_host", ""),
                 phone_cfg.get("music_root", ""),
+                cancel_event=cancel_event,
             )
             self.load_result_queue.put(
                 {
@@ -2295,16 +2449,25 @@ json.dump(out, sys.stdout)
                     "error": None,
                 }
             )
+        except PhoneTransferCancelled as e:
+            self.load_result_queue.put({"view": "phone_transfer", "item": item, "cancelled": True, "error": e})
         except Exception as e:
             logging.exception("Failed to send album to phone")
             self.load_result_queue.put({"view": "phone_transfer", "item": item, "error": e})
 
     def finish_phone_transfer(self, result):
         self.phone_transfer_pending = max(0, self.phone_transfer_pending - 1)
+        self.phone_transfer_cancel_event = None
         error = result.get("error")
         item = result.get("item") or {}
+        if result.get("cancelled"):
+            self.complete_phone_transfer_dialog("Phone send cancelled")
+            self.update_status("phone send cancelled")
+            return
         if error is not None:
-            self.update_status(f"phone send error: {error}")
+            message = f"phone send error: {error}"
+            self.complete_phone_transfer_dialog("Phone send failed", message)
+            self.update_status(message)
             return
         prepared = result.get("prepared") or {}
         copied = result.get("copied") or {}
@@ -2313,9 +2476,9 @@ json.dump(out, sys.stdout)
         kind = prepared.get("kind", "album")
         created = ", transcoded" if prepared.get("created") else ""
         cover = ", cover" if result.get("cover_copied") else ""
-        self.update_status(
-            f"sent {kind}{created}{cover}: {item.get('artist', '')} - {item.get('album', '')} -> {copied.get('name', 'phone')}".rstrip(" -")
-        )
+        message = f"sent {kind}{created}{cover}: {item.get('artist', '')} - {item.get('album', '')} -> {copied.get('name', 'phone')}".rstrip(" -")
+        self.complete_phone_transfer_dialog("Phone send complete", message, success=True)
+        self.update_status(message)
 
     def save_current_playlist(self):
         if self.active_view != "queue":
