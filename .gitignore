@@ -1,4 +1,5 @@
 config.toml
+gridmode.desktop
 .gridmode-cache/
 .venv/
 __pycache__/

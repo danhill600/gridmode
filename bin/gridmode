@@ -1,3 +1,6 @@
 #!/bin/sh
-cd /home/ob/git/gridmode || exit 1
-exec /home/ob/git/gridmode/.venv/bin/python /home/ob/git/gridmode/gridmode.py
+set -eu
+
+APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$APP_DIR"
+exec "$APP_DIR/.venv/bin/python" "$APP_DIR/gridmode.py" "$@"
