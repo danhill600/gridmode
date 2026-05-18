@@ -1,6 +1,6 @@
 import unittest
 
-from gridmode import phone_folder_match_key
+from gridmode import items_have_mtimes, phone_folder_match_key
 
 
 class PhoneFolderMatchTests(unittest.TestCase):
@@ -12,6 +12,12 @@ class PhoneFolderMatchTests(unittest.TestCase):
 
     def test_empty_name_stays_empty(self):
         self.assertEqual(phone_folder_match_key(""), "")
+
+
+class LibraryMtimeTests(unittest.TestCase):
+    def test_detects_cached_mtimes(self):
+        self.assertFalse(items_have_mtimes([{"mtime": None}, {}]))
+        self.assertTrue(items_have_mtimes([{"mtime": None}, {"mtime": 123.0}]))
 
 
 if __name__ == "__main__":

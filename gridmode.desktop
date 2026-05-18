@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Gridmode
+Comment=Keyboard-first MPD album grid
+Exec=/home/ob/git/gridmode/bin/gridmode
+Path=/home/ob/git/gridmode
+Icon=/home/ob/git/gridmode/assets/gridmode-icon.png
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+StartupNotify=false

@@ -1,0 +1,3 @@
+#!/bin/sh
+cd /home/ob/git/gridmode || exit 1
+exec /home/ob/git/gridmode/.venv/bin/python /home/ob/git/gridmode/gridmode.py

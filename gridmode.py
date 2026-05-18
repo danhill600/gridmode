@@ -16,7 +16,7 @@ import tkinter.font as tkfont
 import time
 import threading
 from collections import OrderedDict
-from tkinter import simpledialog, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import requests
 
@@ -32,10 +32,13 @@ from mpd_service import (
 from phone_service import (
     copy_local_cover_to_remote_album,
     copy_remote_album_to_phone,
+    delete_phone_album_dir,
     list_phone_album_dirs,
+    phone_album_dir_exists,
     PhoneTransferCancelled,
     prepare_album_for_phone,
 )
+from phone_playlist import DEFAULT_PLAYLIST_NAME, generate_playlist_from_config
 from gridmode_cache import (
     DEFAULT_USER_AGENT,
     Image,
@@ -122,6 +125,10 @@ def phone_folder_match_key(name):
     name = re.sub(r"\b(?:web|cd|vinyl|flac|mp3|lossy|v0|vbr|320|24bit|16bit)\b", " ", name, flags=re.IGNORECASE)
     name = re.sub(r"[^0-9a-zA-Z]+", " ", name)
     return re.sub(r"\s+", " ", name).strip().casefold()
+
+
+def items_have_mtimes(items):
+    return any(item.get("mtime") is not None for item in items)
 
 
 def release_year_from_song(song):
@@ -228,20 +235,17 @@ class GridModeApp:
         self.load_result_queue = queue.Queue()
         self.phone_transfer_pending = 0
         self.phone_transfer_cancel_event = None
-        self.phone_transfer_dialog = None
-        self.phone_transfer_phase_var = None
-        self.phone_transfer_detail_var = None
-        self.phone_transfer_elapsed_var = None
-        self.phone_transfer_cancel_button = None
-        self.phone_transfer_close_button = None
-        self.phone_transfer_phone_button = None
         self.phone_transfer_started_at = None
         self.phone_transfer_done = False
-        self.phone_transfer_elapsed_after_id = None
+        self.phone_transfer_title = ""
+        self.phone_delete_pending = 0
+        self.transfer_tab_visible = False
+        self.transfer_return_view = "library"
         self.loading_views = set()
         self.loading_after_id = None
         self.loading_frame = 0
         self.loading_text = ""
+        self.mousewheel_remainder = 0
         self.help_tab_visible = False
         self.help_return_view = "queue"
         self.nowplaying_rerender_id = None
@@ -253,6 +257,7 @@ class GridModeApp:
         self.active_view = "queue"
         self.phone_enabled = bool(cfg.get("phone", {}).get("enabled"))
         self.grid_views = ["queue", "library"] + (["phone"] if self.phone_enabled else [])
+        self.marked_grid_items = {view: set() for view in self.grid_views}
         self.view_items = {view: [] for view in self.grid_views}
         self.view_loaded = {view: False for view in self.grid_views}
         self.view_selected_indices = {view: 0 for view in self.grid_views}
@@ -263,6 +268,12 @@ class GridModeApp:
         self.library_search_matches = []
         self.info_tab_visible = False
         self.info_return_view = "queue"
+        self.hydrate_tab_visible = False
+        self.hydrate_return_view = "library"
+        self.hydrate_process = None
+        self.hydrate_tail_after_id = None
+        self.hydrate_log_path = os.path.join(self.cache_dir, "hydrate.log")
+        self.hydrate_log_position = self.hydrate_log_size()
         self.info_album = None
         self.nowplaying_info = None
         self.info_info = None
@@ -280,6 +291,8 @@ class GridModeApp:
         self.nowplaying_tab = ttk.Frame(self.tabs)
         self.info_tab = ttk.Frame(self.tabs)
         self.help_tab = ttk.Frame(self.tabs)
+        self.hydrate_tab = ttk.Frame(self.tabs)
+        self.transfers_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.queue_tab, text="Queue")
         self.tabs.add(self.library_tab, text="Library")
         if self.phone_enabled:
@@ -324,6 +337,36 @@ class GridModeApp:
         self.help_text.pack(fill="both", expand=True)
         self.help_text.insert("1.0", self.key_help_text())
         self.help_text.configure(state="disabled")
+
+        self.hydrate_frame = ttk.Frame(self.content, padding=12)
+        self.hydrate_text = tk.Text(
+            self.hydrate_frame,
+            wrap="none",
+            bg=PANEL_BG,
+            fg=APP_FG,
+            insertbackground=APP_FG,
+            relief="flat",
+            padx=12,
+            pady=12,
+            font=self.help_font,
+        )
+        self.hydrate_text.pack(fill="both", expand=True)
+        self.hydrate_text.configure(state="disabled")
+
+        self.transfers_frame = ttk.Frame(self.content, padding=12)
+        self.transfers_text = tk.Text(
+            self.transfers_frame,
+            wrap="word",
+            bg=PANEL_BG,
+            fg=APP_FG,
+            insertbackground=APP_FG,
+            relief="flat",
+            padx=12,
+            pady=12,
+            font=self.help_font,
+        )
+        self.transfers_text.pack(fill="both", expand=True)
+        self.transfers_text.configure(state="disabled")
 
         self.nowplaying_frame = ttk.Frame(self.content, padding=12)
         title_box_height = self.nowplaying_title_box_height()
@@ -400,9 +443,12 @@ class GridModeApp:
 
         self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
-        self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)
-        self.canvas.bind_all("<Button-4>", self.on_mousewheel)
-        self.canvas.bind_all("<Button-5>", self.on_mousewheel)
+        self.bind_mousewheel(self.canvas)
+        self.bind_mousewheel(self.track_text)
+        self.bind_mousewheel(self.bio_text)
+        self.bind_mousewheel(self.help_text)
+        self.bind_mousewheel(self.hydrate_text)
+        self.bind_mousewheel(self.transfers_text)
 
         arrow_intercepts = (self.tabs, self.canvas, self.track_text, self.bio_text)
         self.bind_repeating_key("Left", lambda: self.move_selection(-1, 0), intercept_widgets=arrow_intercepts)
@@ -417,36 +463,41 @@ class GridModeApp:
         self.bind_repeating_key("K", lambda: self.move_pane_or_page(-1))
         self.bind_repeating_key("Next", lambda: self.move_pane_or_page(1), intercept_widgets=arrow_intercepts)
         self.bind_repeating_key("Prior", lambda: self.move_pane_or_page(-1), intercept_widgets=arrow_intercepts)
-        self.root.bind_all("H", lambda e: self.switch_relative_tab(-1))
-        self.root.bind_all("L", lambda e: self.switch_relative_tab(1))
-        self.root.bind_all("g", lambda e: self.handle_g_key())
-        self.root.bind_all("G", lambda e: self.jump_grid_position("bottom"))
-        self.root.bind_all("M", lambda e: self.jump_grid_position("middle"))
-        self.root.bind_all("z", lambda e: self.jump_grid_position("random"))
-        self.root.bind_all("s", lambda e: self.save_current_playlist())
-        self.root.bind_all("S", lambda e: self.save_current_playlist_as())
-        self.root.bind_all("t", lambda e: self.append_current_song_to_sick_tunes())
-        self.root.bind_all("/", lambda e: self.begin_library_search())
-        self.root.bind_all("n", lambda e: self.next_library_search_match(1))
-        self.root.bind_all("N", lambda e: self.next_library_search_match(-1))
-        self.root.bind_all("<Return>", lambda e: self.on_select())
-        self.root.bind_all("<Tab>", lambda e: self.toggle_text_pane_focus())
-        self.root.bind_all("<ISO_Left_Tab>", lambda e: self.toggle_text_pane_focus())
+        self.root.bind_all("H", self.global_key(lambda e: self.switch_relative_tab(-1)))
+        self.root.bind_all("L", self.global_key(lambda e: self.switch_relative_tab(1)))
+        self.root.bind_all("g", self.global_key(lambda e: self.handle_g_key()))
+        self.root.bind_all("G", self.global_key(lambda e: self.jump_grid_position("bottom")))
+        self.root.bind_all("M", self.global_key(lambda e: self.jump_grid_position("middle")))
+        self.root.bind_all("z", self.global_key(lambda e: self.jump_grid_position("random")))
+        self.root.bind_all("s", self.global_key(lambda e: self.save_current_playlist()))
+        self.root.bind_all("S", self.global_key(lambda e: self.save_current_playlist_as()))
+        self.root.bind_all("t", self.global_key(lambda e: self.append_current_song_to_sick_tunes()))
+        self.root.bind_all("u", self.global_key(lambda e: self.confirm_hydrate_covers()))
+        self.root.bind_all("c", self.global_key(lambda e: self.cancel_phone_transfer_from_key()))
+        self.root.bind_all("m", self.global_key(lambda e: self.toggle_phone_mark()))
+        self.root.bind_all("/", self.global_key(lambda e: self.begin_library_search()))
+        self.root.bind_all("n", self.global_key(lambda e: self.next_library_search_match(1)))
+        self.root.bind_all("N", self.global_key(lambda e: self.next_library_search_match(-1)))
+        self.root.bind_all("<Return>", self.global_key(lambda e: self.on_select()))
+        self.root.bind_all("<Tab>", self.global_key(lambda e: self.toggle_text_pane_focus()))
+        self.root.bind_all("<ISO_Left_Tab>", self.global_key(lambda e: self.toggle_text_pane_focus()))
         self.root.bind("1", lambda e: self.switch_tab(0))
         self.root.bind("2", lambda e: self.switch_tab(1))
         self.root.bind("3", lambda e: self.switch_tab(2))
         self.root.bind("4", lambda e: self.switch_tab(3))
-        self.root.bind_all("a", lambda e: self.add_selected_library_album_after_current())
-        self.root.bind_all("A", lambda e: self.append_selected_library_album())
-        self.root.bind_all("d", lambda e: self.remove_selected_queue_album())
-        self.root.bind_all("p", lambda e: self.send_selected_album_to_phone())
-        self.root.bind_all("i", lambda e: self.toggle_info_tab())
-        self.root.bind_all("o", lambda e: self.jump_to_current_album())
-        self.root.bind_all("?", lambda e: self.show_key_help())
+        self.root.bind("5", lambda e: self.switch_tab(4))
+        self.root.bind("6", lambda e: self.switch_tab(5))
+        self.root.bind_all("a", self.global_key(lambda e: self.add_selected_library_album_after_current()))
+        self.root.bind_all("A", self.global_key(lambda e: self.append_selected_library_album()))
+        self.root.bind_all("d", self.global_key(lambda e: self.remove_selected_queue_album()))
+        self.root.bind_all("p", self.global_key(lambda e: self.send_selected_album_to_phone()))
+        self.root.bind_all("i", self.global_key(lambda e: self.toggle_info_tab()))
+        self.root.bind_all("o", self.global_key(lambda e: self.jump_to_current_album()))
+        self.root.bind_all("?", self.global_key(lambda e: self.show_key_help()))
         self.root.bind("f", lambda e: self.toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.root.bind("r", lambda e: self.refresh_from_key())
-        self.root.bind_all("q", lambda e: self.close_info_or_quit())
+        self.root.bind_all("q", self.global_key(lambda e: self.close_info_or_quit()))
         self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.root.bind("<Configure>", self.on_root_configure)
 
@@ -486,35 +537,63 @@ class GridModeApp:
             "bio_size": self.nowplaying_bio_font.actual("size"),
         }
         return {
-            "small": self.scaled_nowplaying_profile(base, 0.76),
-            "medium": self.scaled_nowplaying_profile(base, 0.88),
+            "small": self.scaled_nowplaying_profile(base, cover=0.82, title=0.58, text=0.76, bio=0.76),
+            "medium": self.scaled_nowplaying_profile(base, cover=1.50, title=0.64, text=0.82, bio=0.82),
             "large": base,
         }
 
-    def scaled_nowplaying_profile(self, base, scale):
+    def scaled_nowplaying_profile(self, base, cover, title, text, bio):
         return {
-            "cover": max(280, round(base["cover"] * scale)),
-            "title_size": max(18, round(base["title_size"] * scale)),
-            "text_size": max(12, round(base["text_size"] * scale)),
-            "bio_size": max(12, round(base["bio_size"] * scale)),
+            "cover": max(280, min(720, round(base["cover"] * cover))),
+            "title_size": max(16, round(base["title_size"] * title)),
+            "text_size": max(12, round(base["text_size"] * text)),
+            "bio_size": max(12, round(base["bio_size"] * bio)),
         }
 
     def on_root_configure(self, event=None):
         if event is not None and event.widget is not self.root:
             return
-        self.apply_nowplaying_profile_for_size(self.root.winfo_width(), self.root.winfo_height())
+        self.apply_nowplaying_profile_for_size(
+            self.root.winfo_width(),
+            self.root.winfo_height(),
+            self.screen_dpi(),
+            self.screen_width_inches(),
+        )
 
-    def nowplaying_profile_for_size(self, width, height):
+    def screen_dpi(self):
+        try:
+            width_px = self.root.winfo_screenwidth()
+            width_mm = self.root.winfo_screenmmwidth()
+        except tk.TclError:
+            return 96
+        if width_px <= 0 or width_mm <= 0:
+            return 96
+        return width_px / (width_mm / 25.4)
+
+    def screen_width_inches(self):
+        try:
+            width_mm = self.root.winfo_screenmmwidth()
+        except tk.TclError:
+            return 0
+        return width_mm / 25.4 if width_mm > 0 else 0
+
+    def nowplaying_profile_for_size(self, width, height, dpi=96, screen_width_inches=0):
+        physically_large = screen_width_inches >= 34 and dpi < 95
+        dense_desktop = dpi >= 110
         if width < 1200 or height < 720:
             return "small"
-        if width < 1700 or height < 950:
+        if dense_desktop:
+            return "medium"
+        if physically_large and width >= 1700 and height >= 950:
+            return "large"
+        if width < 2400 or height < 1300:
             return "medium"
         return "large"
 
-    def apply_nowplaying_profile_for_size(self, width, height):
+    def apply_nowplaying_profile_for_size(self, width, height, dpi=96, screen_width_inches=0):
         if width <= 1 or height <= 1:
             return
-        profile_name = self.nowplaying_profile_for_size(width, height)
+        profile_name = self.nowplaying_profile_for_size(width, height, dpi, screen_width_inches)
         if profile_name == self.nowplaying_profile:
             return
         self.nowplaying_profile = profile_name
@@ -548,16 +627,38 @@ class GridModeApp:
             self.render_nowplaying(info)
 
     def nowplaying_title_box_height(self):
-        return self.nowplaying_title_font.metrics("linespace") * 4
+        return self.nowplaying_title_font.metrics("linespace") * 5
+
+    def global_key(self, callback):
+        def wrapped(event):
+            if self.popup_has_focus(event):
+                return None
+            return callback(event)
+
+        return wrapped
+
+    def popup_has_focus(self, event=None):
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            try:
+                widget = self.root.focus_get()
+            except tk.TclError:
+                return False
+        if widget is None:
+            return False
+        try:
+            return widget.winfo_toplevel() is not self.root
+        except tk.TclError:
+            return False
 
     def bind_repeating_key(self, key, action, intercept_widgets=()):
         self.root.bind_all(
             f"<KeyPress-{key}>",
-            lambda event, key=key, action=action: self.start_key_repeat(key, action),
+            self.global_key(lambda event, key=key, action=action: self.start_key_repeat(key, action)),
         )
         self.root.bind_all(
             f"<KeyRelease-{key}>",
-            lambda event, key=key: self.schedule_key_repeat_stop(key),
+            self.global_key(lambda event, key=key: self.schedule_key_repeat_stop(key)),
         )
         for widget in intercept_widgets:
             widget.bind(
@@ -568,6 +669,12 @@ class GridModeApp:
                 f"<KeyRelease-{key}>",
                 lambda event, key=key: self.schedule_key_repeat_stop(key),
             )
+
+    def bind_mousewheel(self, widget, bind_all=False):
+        bind = widget.bind_all if bind_all else widget.bind
+        bind("<MouseWheel>", self.on_mousewheel)
+        bind("<Button-4>", self.on_mousewheel)
+        bind("<Button-5>", self.on_mousewheel)
 
     def start_key_repeat(self, key, action):
         if self.pending_leader:
@@ -677,8 +784,8 @@ class GridModeApp:
             self.start_library_load(rebuild=rebuild)
             return
         if self.active_view == "phone":
-            self.view_items["phone"] = self.load_phone_items()
-            self.view_loaded["phone"] = True
+            self.start_phone_load()
+            return
         else:
             self.view_items["queue"] = self.load_queue_items()
             self.view_loaded["queue"] = True
@@ -820,8 +927,10 @@ class GridModeApp:
         cached_items = self.load_library_index()
         if not rebuild:
             if cached_items:
-                self.library_error = ""
-                return cached_items
+                music_root = self.cfg.get("music", {}).get("root", "")
+                if not music_root or items_have_mtimes(cached_items):
+                    self.library_error = ""
+                    return cached_items
 
         records = self.load_records(library=True)
         mtimes = self.load_library_mtimes(records)
@@ -957,6 +1066,17 @@ json.dump(out, sys.stdout)
             self.show_help_panel()
             self.update_status()
             return
+        if tab_text == "Hydrate":
+            self.active_view = "hydrate"
+            self.show_hydrate_panel()
+            self.update_status()
+            self.start_hydrate_tail()
+            return
+        if tab_text == "Transfers":
+            self.active_view = "transfers"
+            self.show_transfers_panel()
+            self.update_status()
+            return
         if tab_text == "Library":
             self.active_view = "library"
         elif tab_text == "Phone":
@@ -967,6 +1087,8 @@ json.dump(out, sys.stdout)
         if not self.view_loaded[self.active_view]:
             if self.active_view == "library":
                 self.start_library_load()
+            elif self.active_view == "phone":
+                self.start_phone_load()
             else:
                 self.refresh()
             return
@@ -977,11 +1099,15 @@ json.dump(out, sys.stdout)
     def show_grid_panel(self):
         self.help_frame.pack_forget()
         self.nowplaying_frame.pack_forget()
+        self.hydrate_frame.pack_forget()
+        self.transfers_frame.pack_forget()
         if not self.canvas.winfo_ismapped():
             self.canvas.pack(side="left", fill="both", expand=True)
 
     def show_nowplaying_panel(self):
         self.help_frame.pack_forget()
+        self.hydrate_frame.pack_forget()
+        self.transfers_frame.pack_forget()
         self.canvas.pack_forget()
         if not self.nowplaying_frame.winfo_ismapped():
             self.nowplaying_frame.pack(side="top", fill="both", expand=True)
@@ -989,8 +1115,26 @@ json.dump(out, sys.stdout)
     def show_help_panel(self):
         self.canvas.pack_forget()
         self.nowplaying_frame.pack_forget()
+        self.hydrate_frame.pack_forget()
+        self.transfers_frame.pack_forget()
         if not self.help_frame.winfo_ismapped():
             self.help_frame.pack(side="top", fill="both", expand=True)
+
+    def show_hydrate_panel(self):
+        self.canvas.pack_forget()
+        self.nowplaying_frame.pack_forget()
+        self.help_frame.pack_forget()
+        self.transfers_frame.pack_forget()
+        if not self.hydrate_frame.winfo_ismapped():
+            self.hydrate_frame.pack(side="top", fill="both", expand=True)
+
+    def show_transfers_panel(self):
+        self.canvas.pack_forget()
+        self.nowplaying_frame.pack_forget()
+        self.help_frame.pack_forget()
+        self.hydrate_frame.pack_forget()
+        if not self.transfers_frame.winfo_ismapped():
+            self.transfers_frame.pack(side="top", fill="both", expand=True)
 
     def switch_tab(self, idx):
         if idx < 0 or idx >= len(self.tabs.tabs()):
@@ -1014,7 +1158,15 @@ json.dump(out, sys.stdout)
         return "break"
 
     def view_tab_index(self, view):
-        labels = {"queue": "Queue", "library": "Library", "phone": "Phone", "nowplaying": "Now Playing", "info": "Info"}
+        labels = {
+            "queue": "Queue",
+            "library": "Library",
+            "phone": "Phone",
+            "nowplaying": "Now Playing",
+            "info": "Info",
+            "hydrate": "Hydrate",
+            "transfers": "Transfers",
+        }
         wanted = labels.get(view)
         if wanted is None:
             return None
@@ -1080,6 +1232,58 @@ json.dump(out, sys.stdout)
             logging.exception("Failed to load library in background")
             self.load_result_queue.put({"view": "library", "error": e})
 
+    def start_phone_load(self):
+        if "phone" in self.loading_views:
+            self.render_loading("ur phobe is lobing sweetpal")
+            return
+        self.loading_views.add("phone")
+        self.view_grid_cache.pop("phone", None)
+        self.view_loaded["phone"] = False
+        self.begin_loading_screen()
+        self.root.update_idletasks()
+        self.render_loading("ur phobe is lobing sweetpal")
+        self.start_loading_animation("ur phobe is lobing sweetpal")
+        self.root.update_idletasks()
+        self.root.after(80, self.start_phone_load_worker)
+
+    def start_phone_load_worker(self):
+        if "phone" not in self.loading_views:
+            return
+        thread = threading.Thread(target=self.phone_load_worker, daemon=True)
+        thread.start()
+        self.root.after(100, self.poll_load_results)
+
+    def phone_load_worker(self):
+        started_at = time.monotonic()
+        try:
+            items = self.load_phone_items()
+            items_loaded_at = time.monotonic()
+            albums = [(item["artist"], item["album"]) for item in items]
+            album_keys = [item["key"] for item in items]
+            cover_paths, covers_ok, covers_failed = self.cover_paths_for(albums, album_keys)
+            covers_loaded_at = time.monotonic()
+            logging.info(
+                "Phone load timings: items=%.3fs covers=%.3fs total=%.3fs",
+                items_loaded_at - started_at,
+                covers_loaded_at - items_loaded_at,
+                covers_loaded_at - started_at,
+            )
+            self.load_result_queue.put(
+                {
+                    "view": "phone_load",
+                    "items": items,
+                    "albums": albums,
+                    "album_keys": album_keys,
+                    "cover_paths": cover_paths,
+                    "covers_ok": covers_ok,
+                    "covers_failed": covers_failed,
+                    "error": None,
+                }
+            )
+        except Exception as e:
+            logging.exception("Failed to load phone in background")
+            self.load_result_queue.put({"view": "phone_load", "error": e})
+
     def poll_load_results(self):
         handled = False
         while True:
@@ -1090,12 +1294,18 @@ json.dump(out, sys.stdout)
             handled = True
             if result.get("view") == "library":
                 self.finish_library_load(result)
+            elif result.get("view") == "phone_load":
+                self.finish_phone_load(result)
             elif result.get("view") == "phone_transfer_progress":
-                self.update_phone_transfer_dialog(result.get("phase", "Sending to phone..."))
+                self.update_phone_transfer_status(result.get("phase", "Sending to phone..."))
             elif result.get("view") == "phone_transfer":
                 self.finish_phone_transfer(result)
+            elif result.get("view") == "phone_delete":
+                self.finish_phone_delete(result)
 
-        if self.loading_views or self.phone_transfer_pending:
+        if self.phone_transfer_pending and self.active_view == "transfers":
+            self.update_status()
+        if self.loading_views or self.phone_transfer_pending or self.phone_delete_pending:
             self.root.after(100, self.poll_load_results)
         elif handled:
             self.stop_loading_animation()
@@ -1133,6 +1343,39 @@ json.dump(out, sys.stdout)
             self.covers_failed,
         )
 
+    def finish_phone_load(self, result):
+        self.loading_views.discard("phone")
+        self.stop_loading_animation()
+        error = result.get("error")
+        if error is not None:
+            self.update_status(f"phone load error: {error}")
+            if self.active_view == "phone":
+                self.render_loading("Phone load failed")
+            return
+
+        self.view_items["phone"] = result["items"]
+        self.view_loaded["phone"] = True
+        self.prune_phone_marks()
+        self.view_grid_cache["phone"] = {
+            "albums": result["albums"],
+            "album_keys": result["album_keys"],
+            "cover_paths": result["cover_paths"],
+            "covers_ok": result["covers_ok"],
+            "covers_failed": result["covers_failed"],
+        }
+        if self.active_view != "phone":
+            return
+        self.clear_loading_items()
+        self.apply_grid_cache("phone")
+        self.reset_images()
+        self.render_grid()
+        logging.info(
+            "Loaded %d phone albums; covers cached=%d missing=%d",
+            len(self.albums),
+            self.covers_ok,
+            self.covers_failed,
+        )
+
     def start_loading_animation(self, text):
         self.loading_text = text
         if self.loading_after_id is None:
@@ -1153,9 +1396,10 @@ json.dump(out, sys.stdout)
         self.canvas.delete("all")
         self.loading_bg_item = None
         self.loading_text_item = None
+        self.canvas.yview_moveto(0)
 
     def animate_loading(self):
-        if self.active_view == "library" and "library" in self.loading_views:
+        if self.active_view in self.loading_views:
             self.render_loading(self.loading_text)
             self.loading_frame += 1
             delay = 160
@@ -1168,25 +1412,27 @@ json.dump(out, sys.stdout)
         self.canvas.update_idletasks()
         width = max(self.canvas.winfo_width(), 1)
         height = max(self.canvas.winfo_height(), 1)
+        top = self.canvas.canvasy(0)
+        bottom = top + height
         if self.loading_bg_item is None:
             self.loading_bg_item = self.canvas.create_rectangle(
                 0,
-                0,
+                top,
                 width,
-                height,
+                bottom,
                 fill=PANEL_BG,
                 outline=PANEL_BG,
                 tags=("loading",),
             )
             self.canvas.tag_lower(self.loading_bg_item)
         else:
-            self.canvas.coords(self.loading_bg_item, 0, 0, width, height)
+            self.canvas.coords(self.loading_bg_item, 0, top, width, bottom)
 
         spinner = "|/-\\"[self.loading_frame % 4]
         if self.loading_text_item is None:
             self.loading_text_item = self.canvas.create_text(
                 width // 2,
-                height // 2,
+                top + height // 2,
                 text=f"{text} {spinner}",
                 fill=APP_FG,
                 font=self.font,
@@ -1194,7 +1440,7 @@ json.dump(out, sys.stdout)
                 tags=("loading",),
             )
         else:
-            self.canvas.coords(self.loading_text_item, width // 2, height // 2)
+            self.canvas.coords(self.loading_text_item, width // 2, top + height // 2)
             self.canvas.itemconfigure(self.loading_text_item, text=f"{text} {spinner}")
         self.update_status(text.lower())
 
@@ -1333,6 +1579,8 @@ json.dump(out, sys.stdout)
             img_x = x0 + (cell_w - self.padding - self.cell_size) // 2
             img_y = y0 + self.top_gap
             self.canvas.create_image(img_x, img_y, image=image, anchor="nw")
+            if self.grid_item_marked(self.active_view, self.active_items()[idx]):
+                self.render_phone_mark(x0, y0, x1)
 
             self.canvas.create_text(
                 x0 + (cell_w - self.padding) // 2,
@@ -1355,6 +1603,28 @@ json.dump(out, sys.stdout)
                 )
     def title_text(self, artist, max_width):
         return elide_text(artist, self.title_font, max_width)
+
+    def render_phone_mark(self, x0, y0, x1):
+        radius = 10
+        cx = x1 - radius - 8
+        cy = y0 + radius + 8
+        self.canvas.create_oval(
+            cx - radius,
+            cy - radius,
+            cx + radius,
+            cy + radius,
+            fill="#7fff00",
+            outline="#d7ff9f",
+            width=2,
+        )
+        self.canvas.create_text(
+            cx,
+            cy,
+            text="v",
+            fill="#003b00",
+            font=self.font,
+            anchor="center",
+        )
 
     def update_status(self, note=None):
         if self.active_view == "nowplaying":
@@ -1380,6 +1650,29 @@ json.dump(out, sys.stdout)
             msg += " | ? or q=close help"
             self.status.configure(text=msg)
             return
+        if self.active_view == "hydrate":
+            running = self.hydrate_process is not None and self.hydrate_process.poll() is None
+            msg = "Hydrate"
+            if note:
+                msg += f" | {note}"
+            msg += " | running" if running else " | idle"
+            msg += " | u=start hydrate, q=close hydrate"
+            self.status.configure(text=msg)
+            return
+        if self.active_view == "transfers":
+            msg = "Transfers"
+            if note:
+                msg += f" | {note}"
+            if self.phone_transfer_pending and self.phone_transfer_started_at is not None:
+                elapsed = int(time.monotonic() - self.phone_transfer_started_at)
+                msg += f" | running {elapsed}s"
+            elif self.phone_delete_pending:
+                msg += " | deleting"
+            else:
+                msg += " | idle"
+            msg += " | c=cancel active transfer, q=close transfers"
+            self.status.configure(text=msg)
+            return
         view = {"queue": "Queue", "library": "Library", "phone": "Phone"}.get(self.active_view, self.active_view.title())
         msg = f"{view}: {len(self.albums)} albums | covers cached {self.covers_ok}, missing {self.covers_failed}"
         if self.active_view == "library":
@@ -1391,9 +1684,11 @@ json.dump(out, sys.stdout)
             msg += " | no ImageMagick or Pillow"
         elif not self.convert_available:
             msg += " | no ImageMagick"
+        if self.active_view in self.grid_views and self.marked_grid_items.get(self.active_view):
+            msg += f" | marked {len(self.marked_items_for_view(self.active_view))}"
         if note:
             msg += f" | {note}"
-        msg += " | 1/2/3/4 tabs, Enter=add/select, p=send to phone, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh, q=quit"
+        msg += " | 1-6 tabs, Enter=add/select, m=mark, d=delete/remove, p=send to phone, u=hydrate, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh, q=quit"
         self.status.configure(text=msg)
 
     def set_fullscreen(self, enabled):
@@ -1408,6 +1703,12 @@ json.dump(out, sys.stdout)
     def close_info_or_quit(self):
         if self.active_view == "help":
             self.close_key_help()
+            return "break"
+        if self.active_view == "hydrate":
+            self.close_hydrate_tab()
+            return "break"
+        if self.active_view == "transfers":
+            self.close_transfers_tab()
             return "break"
         if self.active_view == "info":
             self.close_info_tab()
@@ -1425,6 +1726,135 @@ json.dump(out, sys.stdout)
             self.help_tab_visible = True
         self.tabs.select(self.help_tab)
         return "break"
+
+    def show_hydrate_tab(self):
+        self.hydrate_return_view = self.active_view if self.active_view in (*self.grid_views, "nowplaying", "info") else "library"
+        if not self.hydrate_tab_visible:
+            self.tabs.add(self.hydrate_tab, text="Hydrate")
+            self.hydrate_tab_visible = True
+        self.tabs.select(self.hydrate_tab)
+        return "break"
+
+    def show_transfers_tab(self):
+        self.transfer_return_view = self.active_view if self.active_view in (*self.grid_views, "nowplaying", "info", "hydrate") else "library"
+        if not self.transfer_tab_visible:
+            self.tabs.add(self.transfers_tab, text="Transfers")
+            self.transfer_tab_visible = True
+        self.tabs.select(self.transfers_tab)
+        return "break"
+
+    def close_transfers_tab(self):
+        return_view = self.transfer_return_view if self.transfer_return_view in (*self.grid_views, "nowplaying", "info", "hydrate") else "library"
+        if self.transfer_tab_visible:
+            self.tabs.hide(self.transfers_tab)
+            self.transfer_tab_visible = False
+        self.select_view_tab(return_view)
+        return "break"
+
+    def close_hydrate_tab(self):
+        return_view = self.hydrate_return_view if self.hydrate_return_view in (*self.grid_views, "nowplaying", "info") else "library"
+        if self.hydrate_tab_visible:
+            self.tabs.hide(self.hydrate_tab)
+            self.hydrate_tab_visible = False
+        self.select_view_tab(return_view)
+        return "break"
+
+    def confirm_hydrate_covers(self):
+        if self.active_view == "help":
+            return "break"
+        if self.hydrate_process is not None and self.hydrate_process.poll() is None:
+            self.show_hydrate_tab()
+            self.update_status("hydrate already running")
+            return "break"
+        ok = messagebox.askyesno(
+            "Hydrate covers",
+            "Hydrate up to 100 missing covers now?\n\nProgress will open in the Hydrate tab.",
+            parent=self.root,
+        )
+        if not ok:
+            self.update_status("hydrate cancelled")
+            return "break"
+        return self.start_hydrate_covers()
+
+    def start_hydrate_covers(self):
+        self.show_hydrate_tab()
+        self.set_hydrate_text("")
+        self.hydrate_log_position = self.hydrate_log_size()
+        cmd = [sys.executable, "hydrate_covers.py", "--library-index", "--limit", "100"]
+        try:
+            self.hydrate_process = subprocess.Popen(
+                cmd,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as e:
+            self.append_hydrate_text(f"hydrate start error: {e}\n")
+            self.update_status(f"hydrate start error: {e}")
+            return "break"
+        self.append_hydrate_text("started: " + " ".join(cmd) + "\n")
+        self.start_hydrate_tail()
+        self.update_status("hydrate started")
+        return "break"
+
+    def hydrate_log_size(self):
+        try:
+            return os.path.getsize(self.hydrate_log_path)
+        except OSError:
+            return 0
+
+    def set_hydrate_text(self, text):
+        self.hydrate_text.configure(state="normal")
+        self.hydrate_text.delete("1.0", "end")
+        if text:
+            self.hydrate_text.insert("end", text)
+        self.hydrate_text.configure(state="disabled")
+
+    def append_hydrate_text(self, text):
+        if not text:
+            return
+        self.hydrate_text.configure(state="normal")
+        self.hydrate_text.insert("end", text)
+        self.hydrate_text.see("end")
+        self.hydrate_text.configure(state="disabled")
+
+    def start_hydrate_tail(self):
+        if self.hydrate_tail_after_id is None:
+            self.tail_hydrate_log()
+
+    def stop_hydrate_tail(self):
+        if self.hydrate_tail_after_id is not None:
+            self.root.after_cancel(self.hydrate_tail_after_id)
+            self.hydrate_tail_after_id = None
+
+    def tail_hydrate_log(self):
+        try:
+            with open(self.hydrate_log_path, "r", encoding="utf-8") as f:
+                f.seek(self.hydrate_log_position)
+                chunk = f.read()
+                self.hydrate_log_position = f.tell()
+        except OSError:
+            chunk = ""
+        if chunk:
+            self.append_hydrate_text(chunk)
+
+        running = self.hydrate_process is not None and self.hydrate_process.poll() is None
+        if self.hydrate_process is not None and not running:
+            code = self.hydrate_process.returncode
+            self.append_hydrate_text(f"hydrate exited: {code}\n")
+            self.hydrate_process = None
+            self.view_grid_cache.pop("library", None)
+            if self.active_view == "library":
+                self.prepare_active_grid(use_cache=False)
+                self.reset_images()
+                self.render_grid()
+            else:
+                self.update_status("hydrate finished")
+
+        if running or self.active_view == "hydrate":
+            self.hydrate_tail_after_id = self.root.after(500, self.tail_hydrate_log)
+        else:
+            self.hydrate_tail_after_id = None
 
     def handle_g_key(self):
         if self.active_view not in self.grid_views:
@@ -1545,7 +1975,7 @@ json.dump(out, sys.stdout)
                 "Tabs",
                 "  1  Queue",
                 "  2  Library",
-                "  3  Now Playing",
+                "  3-6 visible tabs",
                 "",
                 "Grid Navigation",
                 "  h / Left   move left",
@@ -1564,7 +1994,9 @@ json.dump(out, sys.stdout)
                 "",
                 "Queue",
                 "  Enter      play selected album",
+                "  m          mark selected album for phone send",
                 "  d          remove selected album from current playlist",
+                "  p          send marked albums, or selected album if none marked",
                 "  i          open selected album info",
                 "  o          jump selection to currently playing album",
                 "  s          save current playlist",
@@ -1573,12 +2005,20 @@ json.dump(out, sys.stdout)
                 "Library",
                 "  /          search artist or album",
                 "  n / N      next / previous search match",
+                "  m          mark selected album for phone send",
+                "  u          hydrate up to 100 missing covers",
                 "  Enter      insert selected album after current album and play it",
                 "  a          insert selected album after current album",
                 "  A          append selected album to end of playlist",
                 "  i          open selected album info",
                 "  o          jump selection to currently playing album",
                 "  r          rebuild/refresh library",
+                "",
+                "Phone",
+                "  m          mark selected album for phone delete",
+                "  d          delete selected album from phone",
+                "  i          open selected album info",
+                "  r          refresh phone albums",
                 "",
                 "Info",
                 "  j / k      move track highlight",
@@ -1594,6 +2034,8 @@ json.dump(out, sys.stdout)
                 "",
                 "Global",
                 "  H / L      move to previous / next tab",
+                "  p          send selected album to phone and show Transfers",
+                "  c          cancel active transfer from Transfers",
                 "  t          add current song to sick_tunes",
                 "  f          toggle fullscreen",
                 "  Esc        exit fullscreen",
@@ -1614,6 +2056,7 @@ json.dump(out, sys.stdout)
         selected_row = self.selected_index // self.columns
         if previous_row != selected_row:
             self.ensure_visible(self.selected_index)
+            return
         self.render_visible()
 
     def move_selection(self, dx, dy):
@@ -1730,6 +2173,8 @@ json.dump(out, sys.stdout)
         self.last_selected_index = new_idx
 
     def on_canvas_click(self, event):
+        if self.active_view not in self.grid_views:
+            return "break"
         idx = self.index_at_canvas_point(event.x, event.y)
         if idx is None:
             return "break"
@@ -1856,7 +2301,7 @@ json.dump(out, sys.stdout)
         if self.active_view == "info":
             self.close_info_tab()
             return "break"
-        if self.active_view not in ("queue", "library") or not self.albums:
+        if self.active_view not in ("queue", "library", "phone") or not self.albums:
             return "break"
 
         item = self.active_items()[self.selected_index]
@@ -1908,7 +2353,7 @@ json.dump(out, sys.stdout)
 
         client = connect_mpd(mpd_host, mpd_port, mpd_password, timeout=30)
         try:
-            if self.info_return_view == "library":
+            if self.info_return_view in ("library", "phone"):
                 songs = self.find_library_album_songs(client, item)
             else:
                 songs = self.find_queue_album_songs(client, item)
@@ -2130,13 +2575,22 @@ json.dump(out, sys.stdout)
             self.render_nowplaying(info, schedule_rerender=False)
 
     def load_nowplaying_cover(self, path):
-        if Image is None:
-            return tk.PhotoImage(file=path)
-        with Image.open(path) as image:
-            image = image.convert("RGB")
-            image = image.resize((self.nowplaying_cover_size, self.nowplaying_cover_size))
-            ppm = f"P6 {image.width} {image.height} 255\n".encode("ascii") + image.tobytes()
-        return tk.PhotoImage(data=ppm, format="PPM")
+        if Image is not None:
+            with Image.open(path) as image:
+                image = image.convert("RGB")
+                image = image.resize((self.nowplaying_cover_size, self.nowplaying_cover_size))
+                ppm = f"P6 {image.width} {image.height} 255\n".encode("ascii") + image.tobytes()
+            return tk.PhotoImage(data=ppm, format="PPM")
+        if self.convert_available:
+            proc = subprocess.run(
+                ["convert", path, "-resize", f"{self.nowplaying_cover_size}x{self.nowplaying_cover_size}", "ppm:-"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return tk.PhotoImage(data=proc.stdout, format="PPM")
+        return tk.PhotoImage(file=path)
 
     def set_text_widget(self, widget, text):
         widget.configure(state="normal")
@@ -2266,120 +2720,76 @@ json.dump(out, sys.stdout)
                 return dict(self.nowplaying_info)
         return None
 
-    def show_phone_transfer_dialog(self, item):
-        if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
-            self.phone_transfer_dialog.lift()
-            return
-
+    def phone_transfer_item_title(self, item):
         artist = item.get("artist", "")
         album = item.get("album", "")
-        title = f"{artist} - {album}".strip(" -") or item.get("rel_dir", "selected album")
-        self.phone_transfer_phase_var = tk.StringVar(value="Starting phone send")
-        self.phone_transfer_detail_var = tk.StringVar(value=title)
-        self.phone_transfer_elapsed_var = tk.StringVar(value="Elapsed 0s")
+        return f"{artist} - {album}".strip(" -") or item.get("rel_dir", "selected album")
+
+    def transfer_timestamp(self):
+        return time.strftime("%H:%M:%S")
+
+    def append_transfers_text(self, text):
+        if not text:
+            return
+        self.transfers_text.configure(state="normal")
+        self.transfers_text.insert("end", text)
+        self.transfers_text.see("end")
+        self.transfers_text.configure(state="disabled")
+
+    def append_transfer_line(self, text):
+        self.append_transfers_text(f"[{self.transfer_timestamp()}] {text}\n")
+
+    def start_phone_transfer_log(self, item):
+        title = self.phone_transfer_item_title(item)
+        self.phone_transfer_title = title
         self.phone_transfer_done = False
         self.phone_transfer_started_at = time.monotonic()
+        self.show_transfers_tab()
+        self.append_transfer_line(f"phone send started: {title}")
 
-        dialog = tk.Toplevel(self.root)
-        self.phone_transfer_dialog = dialog
-        dialog.title("Sending to Phone")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.configure(bg=APP_BG)
-        dialog.protocol("WM_DELETE_WINDOW", self.cancel_or_close_phone_transfer_dialog)
-
-        frame = ttk.Frame(dialog, padding=16)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Sending to phone", font=self.nowplaying_title_font).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.phone_transfer_detail_var, wraplength=520).pack(anchor="w", pady=(8, 0))
-        ttk.Label(frame, textvariable=self.phone_transfer_phase_var, wraplength=520).pack(anchor="w", pady=(12, 0))
-        ttk.Label(frame, textvariable=self.phone_transfer_elapsed_var).pack(anchor="w", pady=(4, 0))
-
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(16, 0))
-        self.phone_transfer_phone_button = ttk.Button(buttons, text="Phone Tab", command=self.finish_phone_transfer_and_show_phone)
-        self.phone_transfer_phone_button.pack(side="left")
-        self.phone_transfer_phone_button.configure(state="disabled")
-        self.phone_transfer_cancel_button = ttk.Button(buttons, text="Cancel", command=self.cancel_phone_transfer)
-        self.phone_transfer_cancel_button.pack(side="right")
-        self.phone_transfer_close_button = ttk.Button(buttons, text="Close", command=self.close_phone_transfer_dialog)
-        self.phone_transfer_close_button.pack(side="right", padx=(0, 8))
-        self.phone_transfer_close_button.configure(state="disabled")
-
-        self.update_phone_transfer_elapsed()
-        dialog.update_idletasks()
-        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
-        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 3)
-        dialog.geometry(f"+{x}+{y}")
-        dialog.lift()
-
-    def update_phone_transfer_elapsed(self):
-        if self.phone_transfer_dialog is None or not self.phone_transfer_dialog.winfo_exists():
-            self.phone_transfer_elapsed_after_id = None
-            return
-        if self.phone_transfer_started_at is not None and self.phone_transfer_elapsed_var is not None:
-            elapsed = int(time.monotonic() - self.phone_transfer_started_at)
-            self.phone_transfer_elapsed_var.set(f"Elapsed {elapsed}s")
-        if not self.phone_transfer_done:
-            self.phone_transfer_elapsed_after_id = self.root.after(500, self.update_phone_transfer_elapsed)
-        else:
-            self.phone_transfer_elapsed_after_id = None
-
-    def update_phone_transfer_dialog(self, phase, detail=None):
-        if self.phone_transfer_phase_var is not None:
-            self.phone_transfer_phase_var.set(phase)
-        if detail and self.phone_transfer_detail_var is not None:
-            self.phone_transfer_detail_var.set(detail)
+    def update_phone_transfer_status(self, phase):
+        self.append_transfer_line(phase)
         self.update_status(phase.lower())
 
-    def complete_phone_transfer_dialog(self, phase, detail=None, success=False):
+    def complete_phone_transfer_log(self, phase, detail=None):
         self.phone_transfer_done = True
-        self.update_phone_transfer_dialog(phase, detail)
-        if self.phone_transfer_cancel_button is not None:
-            self.phone_transfer_cancel_button.configure(state="disabled")
-        if self.phone_transfer_close_button is not None:
-            self.phone_transfer_close_button.configure(state="normal")
-        if success and self.phone_transfer_phone_button is not None:
-            self.phone_transfer_phone_button.configure(state="normal")
-
-    def cancel_or_close_phone_transfer_dialog(self):
-        if self.phone_transfer_done:
-            self.close_phone_transfer_dialog()
-        else:
-            self.cancel_phone_transfer()
+        elapsed = ""
+        if self.phone_transfer_started_at is not None:
+            elapsed = f" ({int(time.monotonic() - self.phone_transfer_started_at)}s)"
+        self.append_transfer_line(f"{phase}{elapsed}")
+        if detail:
+            self.append_transfer_line(detail)
+        if phase == "Phone send complete" and "phone" in self.grid_views:
+            self.append_transfer_line("press 3 for Phone tab")
 
     def cancel_phone_transfer(self):
         if self.phone_transfer_done:
             return
         if self.phone_transfer_cancel_event is not None:
             self.phone_transfer_cancel_event.set()
-        if self.phone_transfer_cancel_button is not None:
-            self.phone_transfer_cancel_button.configure(state="disabled")
-        self.update_phone_transfer_dialog("Cancelling phone send...")
+        self.update_phone_transfer_status("Cancelling phone send...")
 
-    def close_phone_transfer_dialog(self):
-        if self.phone_transfer_elapsed_after_id is not None:
-            self.root.after_cancel(self.phone_transfer_elapsed_after_id)
-            self.phone_transfer_elapsed_after_id = None
-        if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
-            self.phone_transfer_dialog.destroy()
-        self.phone_transfer_dialog = None
-
-    def finish_phone_transfer_and_show_phone(self):
-        self.close_phone_transfer_dialog()
-        if "phone" in self.grid_views:
-            self.switch_tab(self.grid_views.index("phone"))
+    def cancel_phone_transfer_from_key(self):
+        if self.active_view != "transfers":
+            return None
+        if not self.phone_transfer_pending:
+            self.update_status("no active transfer")
+            return "break"
+        self.cancel_phone_transfer()
+        return "break"
 
     def send_selected_album_to_phone(self):
         if self.active_view == "help":
             return "break"
-        item = self.selected_album_for_phone()
-        if item is None:
-            return "break"
         if self.phone_transfer_pending:
             self.update_status("phone send already in progress")
-            if self.phone_transfer_dialog is not None and self.phone_transfer_dialog.winfo_exists():
-                self.phone_transfer_dialog.lift()
+            self.show_transfers_tab()
+            return "break"
+        marked_items = self.marked_phone_send_items()
+        if marked_items:
+            return self.start_phone_transfer_many(marked_items)
+        item = self.selected_album_for_phone()
+        if item is None:
             return "break"
         phone_cfg = self.cfg.get("phone", {})
         if not phone_cfg.get("enabled"):
@@ -2394,9 +2804,29 @@ json.dump(out, sys.stdout)
 
         self.phone_transfer_pending += 1
         self.phone_transfer_cancel_event = threading.Event()
-        self.show_phone_transfer_dialog(item)
+        self.start_phone_transfer_log(item)
         self.update_status(f"sending to phone: {item.get('artist', '')} - {item.get('album', '')}".rstrip(" -"))
         thread = threading.Thread(target=self.phone_transfer_worker, args=(item, self.phone_transfer_cancel_event), daemon=True)
+        thread.start()
+        self.root.after(100, self.poll_load_results)
+        return "break"
+
+    def start_phone_transfer_many(self, items):
+        phone_cfg = self.cfg.get("phone", {})
+        if not phone_cfg.get("enabled"):
+            self.update_status("phone is not enabled")
+            return "break"
+        if not phone_cfg.get("ssh_host") or not phone_cfg.get("music_root"):
+            self.update_status("phone config missing ssh_host or music_root")
+            return "break"
+        self.phone_transfer_pending += 1
+        self.phone_transfer_cancel_event = threading.Event()
+        self.phone_transfer_done = False
+        self.phone_transfer_started_at = time.monotonic()
+        self.show_transfers_tab()
+        self.append_transfer_line(f"phone bulk send started: {len(items)} albums")
+        self.update_status(f"sending {len(items)} marked albums to phone")
+        thread = threading.Thread(target=self.phone_transfer_many_worker, args=(items, self.active_view, self.phone_transfer_cancel_event), daemon=True)
         thread.start()
         self.root.after(100, self.poll_load_results)
         return "break"
@@ -2406,39 +2836,15 @@ json.dump(out, sys.stdout)
             self.load_result_queue.put({"view": "phone_transfer_progress", "phase": phase})
 
         try:
-            music_cfg = self.cfg.get("music", {})
-            phone_cfg = self.cfg.get("phone", {})
-            progress("Preparing album for phone...")
-            prepared = prepare_album_for_phone(
-                music_cfg.get("ssh_host", ""),
-                music_cfg.get("root", ""),
-                item.get("rel_dir", ""),
-                lossy_root=music_cfg.get("lossy_root", ""),
-                prefer_lossy=music_cfg.get("prefer_lossy_for_phone", True),
-                transcode_missing=music_cfg.get("transcode_missing_lossy", False),
-                cancel_event=cancel_event,
-            )
-            progress("Copying cover art...")
-            cover_path = self.cached_cover_path_from_lookup(
-                self.cover_file_lookup(),
-                item.get("artist", ""),
-                item.get("album", ""),
-                item.get("key"),
-            )
-            cover_copied = copy_local_cover_to_remote_album(
-                cover_path,
-                music_cfg.get("ssh_host", ""),
-                prepared["path"],
-                cancel_event=cancel_event,
-            )
-            progress("Copying album to phone...")
-            copied = copy_remote_album_to_phone(
-                music_cfg.get("ssh_host", ""),
-                prepared["path"],
-                phone_cfg.get("ssh_host", ""),
-                phone_cfg.get("music_root", ""),
-                cancel_event=cancel_event,
-            )
+            prepared, copied, cover_copied = self.send_album_to_phone_for_worker(item, cancel_event, progress)
+            playlist_result = None
+            playlist_error = None
+            if not copied.get("already_exists"):
+                try:
+                    playlist_result = self.update_phone_playlist_for_worker(progress)
+                except Exception as e:
+                    logging.exception("Failed to update phone playlist")
+                    playlist_error = e
             self.load_result_queue.put(
                 {
                     "view": "phone_transfer",
@@ -2446,6 +2852,8 @@ json.dump(out, sys.stdout)
                     "prepared": prepared,
                     "copied": copied,
                     "cover_copied": cover_copied,
+                    "playlist": playlist_result,
+                    "playlist_error": playlist_error,
                     "error": None,
                 }
             )
@@ -2455,30 +2863,199 @@ json.dump(out, sys.stdout)
             logging.exception("Failed to send album to phone")
             self.load_result_queue.put({"view": "phone_transfer", "item": item, "error": e})
 
+    def phone_transfer_many_worker(self, items, source_view, cancel_event):
+        sent_items = []
+        errors = []
+        playlist_result = None
+        playlist_error = None
+
+        def progress(phase):
+            self.load_result_queue.put({"view": "phone_transfer_progress", "phase": phase})
+
+        try:
+            for idx, item in enumerate(items, start=1):
+                progress(f"[{idx}/{len(items)}] {self.phone_transfer_item_title(item)}")
+                prepared, copied, cover_copied = self.send_album_to_phone_for_worker(item, cancel_event, progress)
+                sent_items.append({"item": item, "prepared": prepared, "copied": copied, "cover_copied": cover_copied})
+            playlist_result = None
+            playlist_error = None
+            if any(not (sent.get("copied") or {}).get("already_exists") for sent in sent_items):
+                try:
+                    playlist_result = self.update_phone_playlist_for_worker(progress)
+                except Exception as e:
+                    logging.exception("Failed to update phone playlist")
+                    playlist_error = e
+        except PhoneTransferCancelled as e:
+            self.load_result_queue.put(
+                {
+                    "view": "phone_transfer",
+                    "bulk": True,
+                    "source_view": source_view,
+                    "sent_items": sent_items,
+                    "errors": errors,
+                    "playlist": None,
+                    "playlist_error": None,
+                    "cancelled": True,
+                    "error": e,
+                }
+            )
+            return
+        except Exception as e:
+            logging.exception("Failed to send marked albums to phone")
+            errors.append({"item": item if "item" in locals() else {}, "error": e})
+
+        self.load_result_queue.put(
+            {
+                "view": "phone_transfer",
+                "bulk": True,
+                "source_view": source_view,
+                "sent_items": sent_items,
+                "errors": errors,
+                "playlist": playlist_result,
+                "playlist_error": playlist_error,
+                "error": errors[0]["error"] if errors else None,
+            }
+        )
+
+    def update_phone_playlist_for_worker(self, progress):
+        progress("Updating phone playlist...")
+        result = generate_playlist_from_config(
+            self.cfg,
+            playlist_name=DEFAULT_PLAYLIST_NAME,
+            local_output=os.path.join(self.cache_dir, DEFAULT_PLAYLIST_NAME),
+            copy_to_phone=True,
+        )
+        progress(f"Updated {result['playlist']}: {result['tracks']} tracks")
+        return result
+
+    def send_album_to_phone_for_worker(self, item, cancel_event, progress):
+        music_cfg = self.cfg.get("music", {})
+        phone_cfg = self.cfg.get("phone", {})
+        progress("Preparing album for phone...")
+        prepared = prepare_album_for_phone(
+            music_cfg.get("ssh_host", ""),
+            music_cfg.get("root", ""),
+            item.get("rel_dir", ""),
+            lossy_root=music_cfg.get("lossy_root", ""),
+            prefer_lossy=music_cfg.get("prefer_lossy_for_phone", True),
+            transcode_missing=music_cfg.get("transcode_missing_lossy", False),
+            cancel_event=cancel_event,
+        )
+        phone_leaf = prepared["path"].rstrip("/").rsplit("/", 1)[-1]
+        if phone_album_dir_exists(
+            music_cfg.get("ssh_host", ""),
+            phone_cfg.get("ssh_host", ""),
+            phone_cfg.get("music_root", ""),
+            phone_leaf,
+            cancel_event=cancel_event,
+        ):
+            progress("it's already on the phone, man")
+            return prepared, {"name": phone_leaf, "already_exists": True}, False
+        progress("Copying cover art...")
+        cover_path = self.cached_cover_path_from_lookup(
+            self.cover_file_lookup(),
+            item.get("artist", ""),
+            item.get("album", ""),
+            item.get("key"),
+        )
+        cover_copied = copy_local_cover_to_remote_album(
+            cover_path,
+            music_cfg.get("ssh_host", ""),
+            prepared["path"],
+            cancel_event=cancel_event,
+        )
+        progress("Copying album to phone...")
+        copied = copy_remote_album_to_phone(
+            music_cfg.get("ssh_host", ""),
+            prepared["path"],
+            phone_cfg.get("ssh_host", ""),
+            phone_cfg.get("music_root", ""),
+            cancel_event=cancel_event,
+        )
+        return prepared, copied, cover_copied
+
     def finish_phone_transfer(self, result):
         self.phone_transfer_pending = max(0, self.phone_transfer_pending - 1)
         self.phone_transfer_cancel_event = None
+        if result.get("bulk"):
+            return self.finish_phone_transfer_many(result)
         error = result.get("error")
         item = result.get("item") or {}
         if result.get("cancelled"):
-            self.complete_phone_transfer_dialog("Phone send cancelled")
+            self.complete_phone_transfer_log("Phone send cancelled")
             self.update_status("phone send cancelled")
             return
         if error is not None:
             message = f"phone send error: {error}"
-            self.complete_phone_transfer_dialog("Phone send failed", message)
+            self.complete_phone_transfer_log("Phone send failed", message)
             self.update_status(message)
             return
         prepared = result.get("prepared") or {}
         copied = result.get("copied") or {}
+        if copied.get("already_exists"):
+            message = "it's already on the phone, man"
+            self.complete_phone_transfer_log(message, self.phone_transfer_item_title(item))
+            self.update_status(message)
+            return
+        playlist = result.get("playlist") or {}
+        playlist_error = result.get("playlist_error")
+        if playlist:
+            self.append_transfer_line(f"updated {playlist.get('playlist')}: {playlist.get('tracks')} tracks")
+        if playlist_error is not None:
+            self.append_transfer_line(f"phone playlist error: {playlist_error}")
         self.view_loaded["phone"] = False
         self.view_grid_cache.pop("phone", None)
         kind = prepared.get("kind", "album")
         created = ", transcoded" if prepared.get("created") else ""
+        matched = ", matched existing" if prepared.get("matched") else ""
         cover = ", cover" if result.get("cover_copied") else ""
-        message = f"sent {kind}{created}{cover}: {item.get('artist', '')} - {item.get('album', '')} -> {copied.get('name', 'phone')}".rstrip(" -")
-        self.complete_phone_transfer_dialog("Phone send complete", message, success=True)
+        message = f"sent {kind}{matched}{created}{cover}: {item.get('artist', '')} - {item.get('album', '')} -> {copied.get('name', 'phone')}".rstrip(" -")
+        self.complete_phone_transfer_log("Phone send complete", message)
         self.update_status(message)
+
+    def finish_phone_transfer_many(self, result):
+        self.phone_transfer_done = True
+        source_view = result.get("source_view")
+        sent_items = result.get("sent_items") or []
+        errors = result.get("errors") or []
+        if source_view in self.marked_grid_items:
+            for sent in sent_items:
+                key = self.grid_item_mark_key(source_view, sent.get("item") or {})
+                if key:
+                    self.marked_grid_items[source_view].discard(key)
+        for sent in sent_items:
+            item = sent.get("item") or {}
+            copied = sent.get("copied") or {}
+            if copied.get("already_exists"):
+                self.append_transfer_line(f"it's already on the phone, man: {self.phone_transfer_item_title(item)}")
+            else:
+                self.append_transfer_line(f"sent to phone: {self.phone_transfer_item_title(item)} -> {copied.get('name', 'phone')}")
+        for error in errors:
+            item = error.get("item") or {}
+            self.append_transfer_line(f"phone send error: {self.phone_transfer_item_title(item)}: {error.get('error')}")
+        playlist = result.get("playlist") or {}
+        playlist_error = result.get("playlist_error")
+        if playlist:
+            self.append_transfer_line(f"updated {playlist.get('playlist')}: {playlist.get('tracks')} tracks")
+        if playlist_error is not None:
+            self.append_transfer_line(f"phone playlist error: {playlist_error}")
+        self.view_loaded["phone"] = False
+        self.view_grid_cache.pop("phone", None)
+        if result.get("cancelled"):
+            self.update_status(f"phone send cancelled after {len(sent_items)} albums")
+        elif errors:
+            self.update_status(f"sent {len(sent_items)} marked; {len(errors)} failed")
+        else:
+            sent_count = sum(1 for sent in sent_items if not (sent.get("copied") or {}).get("already_exists"))
+            skipped_count = len(sent_items) - sent_count
+            if sent_count and skipped_count:
+                self.update_status(f"sent {sent_count}; {skipped_count} already on phone")
+            elif skipped_count:
+                self.update_status("it's already on the phone, man")
+            else:
+                self.update_status(f"sent {sent_count} marked albums")
+        if self.active_view == source_view:
+            self.render_visible()
 
     def save_current_playlist(self):
         if self.active_view != "queue":
@@ -2557,14 +3134,317 @@ json.dump(out, sys.stdout)
             return None
         return self.active_items()[self.selected_index]
 
+    def selected_phone_item(self):
+        if self.active_view != "phone" or not self.albums:
+            return None
+        return dict(self.active_items()[self.selected_index])
+
+    def grid_item_mark_key(self, view, item):
+        if view == "phone":
+            return item.get("phone_rel_dir") or item.get("rel_dir") or item.get("phone_name") or ""
+        if item.get("rel_dir"):
+            return item.get("rel_dir")
+        if item.get("positions"):
+            return "positions:" + ",".join(str(pos) for pos in item.get("positions", []))
+        return repr(item.get("key") or (item.get("artist", ""), item.get("album", "")))
+
+    def grid_item_marked(self, view, item):
+        key = self.grid_item_mark_key(view, item)
+        return bool(key and key in self.marked_grid_items.get(view, set()))
+
+    def grid_item_display_name(self, item):
+        return item.get("phone_name") or f"{item.get('artist', '')} - {item.get('album', '')}".strip(" -") or self.grid_item_mark_key(self.active_view, item)
+
+    def toggle_phone_mark(self):
+        if self.active_view not in self.grid_views:
+            return None
+        if not self.albums:
+            return "break"
+        item = self.active_items()[self.selected_index]
+        key = self.grid_item_mark_key(self.active_view, item)
+        if not key:
+            self.update_status("selected album cannot be marked")
+            return "break"
+        marked = self.marked_grid_items.setdefault(self.active_view, set())
+        name = self.grid_item_display_name(item)
+        if key in marked:
+            marked.remove(key)
+            self.update_status(f"unmarked: {name}")
+        else:
+            marked.add(key)
+            self.update_status(f"marked: {name}")
+        self.render_visible()
+        return "break"
+
+    def marked_items_for_view(self, view):
+        marked = self.marked_grid_items.get(view, set())
+        if not marked:
+            return []
+        items = []
+        seen = set()
+        for item in self.view_items.get(view, []):
+            key = self.grid_item_mark_key(view, item)
+            if key and key in marked and key not in seen:
+                marked_item = dict(item)
+                if view == "phone":
+                    marked_item["phone_rel_dir"] = key
+                    marked_item["phone_name"] = marked_item.get("phone_name") or os.path.basename(key)
+                items.append(marked_item)
+                seen.add(key)
+        return items
+
+    def marked_phone_items(self):
+        return self.marked_items_for_view("phone") if self.active_view == "phone" else []
+
+    def marked_phone_send_items(self):
+        if self.active_view not in ("queue", "library"):
+            return []
+        return [item for item in self.marked_items_for_view(self.active_view) if item.get("rel_dir")]
+
+    def prune_phone_marks(self):
+        if "phone" not in self.view_items:
+            return
+        live = {self.grid_item_mark_key("phone", item) for item in self.view_items.get("phone", [])}
+        live.discard("")
+        self.marked_grid_items.setdefault("phone", set()).intersection_update(live)
+
     def remove_selected_queue_album(self):
         if self.active_view == "help":
             return "break"
+        if self.active_view == "phone":
+            return self.confirm_delete_selected_phone_album()
         item = self.selected_queue_item()
         if item is None:
             return "break"
         self.remove_queue_album_from_playlist(item)
         return "break"
+
+    def confirm_delete_selected_phone_album(self):
+        if self.phone_delete_pending:
+            self.show_transfers_tab()
+            self.update_status("phone delete already in progress")
+            return "break"
+        marked_items = self.marked_phone_items()
+        if marked_items:
+            count = len(marked_items)
+            sample = "\n".join(item.get("phone_name") or self.grid_item_mark_key("phone", item) for item in marked_items[:8])
+            if count > 8:
+                sample += f"\n...and {count - 8} more"
+            ok = messagebox.askyesno(
+                "Delete marked from phone",
+                f"Delete {count} marked album{'s' if count != 1 else ''} from the phone?\n\n{sample}",
+                parent=self.root,
+            )
+            if not ok:
+                self.update_status("phone delete cancelled")
+                return "break"
+            self.start_phone_delete_many(marked_items)
+            return "break"
+
+        item = self.selected_phone_item()
+        if item is None:
+            return "break"
+        phone_rel_dir = item.get("phone_rel_dir") or item.get("rel_dir")
+        phone_name = item.get("phone_name") or os.path.basename(str(phone_rel_dir or ""))
+        if not phone_rel_dir:
+            self.update_status("selected phone album has no directory")
+            return "break"
+        ok = messagebox.askyesno(
+            "Delete from phone",
+            f"Delete this album from the phone?\n\n{phone_name}\n\nDirectory:\n{phone_rel_dir}",
+            parent=self.root,
+        )
+        if not ok:
+            self.update_status("phone delete cancelled")
+            return "break"
+        self.start_phone_delete(item, phone_rel_dir, phone_name)
+        return "break"
+
+    def start_phone_delete_many(self, items):
+        phone_cfg = self.cfg.get("phone", {})
+        music_cfg = self.cfg.get("music", {})
+        if not phone_cfg.get("ssh_host") or not phone_cfg.get("music_root"):
+            self.update_status("phone config missing ssh_host or music_root")
+            return
+        self.phone_delete_pending += 1
+        self.show_transfers_tab()
+        self.append_transfer_line(f"phone bulk delete started: {len(items)} albums")
+        self.update_status(f"deleting {len(items)} marked albums from phone")
+        thread = threading.Thread(
+            target=self.phone_delete_many_worker,
+            args=(items, music_cfg, phone_cfg),
+            daemon=True,
+        )
+        thread.start()
+        self.root.after(100, self.poll_load_results)
+
+    def start_phone_delete(self, item, phone_rel_dir, phone_name):
+        phone_cfg = self.cfg.get("phone", {})
+        music_cfg = self.cfg.get("music", {})
+        if not phone_cfg.get("ssh_host") or not phone_cfg.get("music_root"):
+            self.update_status("phone config missing ssh_host or music_root")
+            return
+        self.phone_delete_pending += 1
+        self.show_transfers_tab()
+        self.append_transfer_line(f"phone delete started: {phone_name}")
+        self.append_transfer_line(f"target: {phone_rel_dir}")
+        self.update_status(f"deleting from phone: {phone_name}")
+        thread = threading.Thread(
+            target=self.phone_delete_worker,
+            args=(dict(item), phone_rel_dir, phone_name, music_cfg, phone_cfg),
+            daemon=True,
+        )
+        thread.start()
+        self.root.after(100, self.poll_load_results)
+
+    def phone_delete_worker(self, item, phone_rel_dir, phone_name, music_cfg, phone_cfg):
+        try:
+            deleted = delete_phone_album_dir(
+                music_cfg.get("ssh_host", ""),
+                phone_cfg.get("ssh_host", ""),
+                phone_cfg.get("music_root", ""),
+                phone_rel_dir,
+            )
+            playlist_result = None
+            playlist_error = None
+            try:
+                playlist_result = self.update_phone_playlist_for_worker(
+                    lambda phase: self.load_result_queue.put({"view": "phone_transfer_progress", "phase": phase})
+                )
+            except Exception as e:
+                logging.exception("Failed to update phone playlist")
+                playlist_error = e
+            self.load_result_queue.put(
+                {
+                    "view": "phone_delete",
+                    "item": item,
+                    "name": phone_name,
+                    "rel_dir": phone_rel_dir,
+                    "deleted": deleted,
+                    "playlist": playlist_result,
+                    "playlist_error": playlist_error,
+                    "error": None,
+                }
+            )
+        except Exception as e:
+            logging.exception("Failed to delete phone album")
+            self.load_result_queue.put(
+                {
+                    "view": "phone_delete",
+                    "item": item,
+                    "name": phone_name,
+                    "rel_dir": phone_rel_dir,
+                    "error": e,
+                }
+            )
+
+    def phone_delete_many_worker(self, items, music_cfg, phone_cfg):
+        deleted_items = []
+        errors = []
+        playlist_result = None
+        playlist_error = None
+        for item in items:
+            phone_rel_dir = item.get("phone_rel_dir") or item.get("rel_dir")
+            phone_name = item.get("phone_name") or os.path.basename(str(phone_rel_dir or ""))
+            try:
+                deleted = delete_phone_album_dir(
+                    music_cfg.get("ssh_host", ""),
+                    phone_cfg.get("ssh_host", ""),
+                    phone_cfg.get("music_root", ""),
+                    phone_rel_dir,
+                )
+                deleted_items.append({"item": item, "name": phone_name, "rel_dir": phone_rel_dir, "deleted": deleted})
+            except Exception as e:
+                logging.exception("Failed to delete marked phone album")
+                errors.append({"item": item, "name": phone_name, "rel_dir": phone_rel_dir, "error": e})
+        if deleted_items:
+            try:
+                playlist_result = self.update_phone_playlist_for_worker(
+                    lambda phase: self.load_result_queue.put({"view": "phone_transfer_progress", "phase": phase})
+                )
+            except Exception as e:
+                logging.exception("Failed to update phone playlist")
+                playlist_error = e
+        self.load_result_queue.put(
+            {
+                "view": "phone_delete",
+                "bulk": True,
+                "deleted_items": deleted_items,
+                "errors": errors,
+                "playlist": playlist_result,
+                "playlist_error": playlist_error,
+                "error": errors[0]["error"] if errors else None,
+            }
+        )
+
+    def finish_phone_delete(self, result):
+        self.phone_delete_pending = max(0, self.phone_delete_pending - 1)
+        if result.get("bulk"):
+            return self.finish_phone_delete_many(result)
+        name = result.get("name") or result.get("rel_dir") or "phone album"
+        error = result.get("error")
+        if error is not None:
+            message = f"phone delete error: {error}"
+            self.append_transfer_line(message)
+            self.update_status(message)
+            return
+
+        deleted = result.get("deleted") or {}
+        deleted_name = deleted.get("name") or name
+        rel_dir = result.get("rel_dir") or deleted.get("rel_dir")
+        if rel_dir:
+            self.marked_grid_items.setdefault("phone", set()).discard(rel_dir)
+        playlist = result.get("playlist") or {}
+        playlist_error = result.get("playlist_error")
+        if playlist:
+            self.append_transfer_line(f"updated {playlist.get('playlist')}: {playlist.get('tracks')} tracks")
+        if playlist_error is not None:
+            self.append_transfer_line(f"phone playlist error: {playlist_error}")
+        self.view_loaded["phone"] = False
+        self.view_grid_cache.pop("phone", None)
+        if self.active_view == "phone":
+            previous_index = self.selected_index
+            self.refresh()
+            if self.albums:
+                self.selected_index = min(previous_index, len(self.albums) - 1)
+                self.ensure_visible(self.selected_index)
+                self.render_grid()
+        message = f"deleted from phone: {deleted_name}"
+        self.append_transfer_line(message)
+        self.update_status(message)
+
+    def finish_phone_delete_many(self, result):
+        deleted_items = result.get("deleted_items") or []
+        errors = result.get("errors") or []
+        for deleted in deleted_items:
+            key = deleted.get("rel_dir")
+            if key:
+                self.marked_grid_items.setdefault("phone", set()).discard(key)
+            name = (deleted.get("deleted") or {}).get("name") or deleted.get("name") or key
+            self.append_transfer_line(f"deleted from phone: {name}")
+        for error in errors:
+            name = error.get("name") or error.get("rel_dir") or "phone album"
+            self.append_transfer_line(f"phone delete error: {name}: {error.get('error')}")
+        playlist = result.get("playlist") or {}
+        playlist_error = result.get("playlist_error")
+        if playlist:
+            self.append_transfer_line(f"updated {playlist.get('playlist')}: {playlist.get('tracks')} tracks")
+        if playlist_error is not None:
+            self.append_transfer_line(f"phone playlist error: {playlist_error}")
+
+        self.view_loaded["phone"] = False
+        self.view_grid_cache.pop("phone", None)
+        if self.active_view == "phone":
+            previous_index = self.selected_index
+            self.refresh()
+            if self.albums:
+                self.selected_index = min(previous_index, len(self.albums) - 1)
+                self.ensure_visible(self.selected_index)
+                self.render_grid()
+        if errors:
+            self.update_status(f"deleted {len(deleted_items)} marked; {len(errors)} failed")
+        else:
+            self.update_status(f"deleted {len(deleted_items)} marked albums")
 
     def selected_track(self, view):
         info = self.nowplaying_info if view == "nowplaying" else self.info_info
@@ -2850,15 +3730,46 @@ json.dump(out, sys.stdout)
         self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
 
     def on_mousewheel(self, event):
+        units = self.mousewheel_units(event)
+        if units == 0:
+            return "break"
+        if self.active_view in ("nowplaying", "info"):
+            widget = self.bio_text if self.text_pane_focus.get(self.active_view) == "bio" else self.track_text
+            widget.yview_scroll(units, "units")
+            return "break"
+        if self.active_view == "help":
+            self.help_text.yview_scroll(units, "units")
+            return "break"
+        if self.active_view == "hydrate":
+            self.hydrate_text.yview_scroll(units, "units")
+            return "break"
+        if self.active_view == "transfers":
+            self.transfers_text.yview_scroll(units, "units")
+            return "break"
         if self.active_view not in self.grid_views:
-            return
-        if event.num == 4:
-            self.canvas.yview_scroll(-3, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(3, "units")
+            return "break"
+        if abs(units) == 1:
+            self.canvas.yview_scroll(units, "pages")
         else:
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            self.canvas.yview_scroll(units, "units")
         self.render_visible()
+        return "break"
+
+    def mousewheel_units(self, event):
+        if event.num == 4:
+            return -3
+        if event.num == 5:
+            return 3
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return 0
+        if abs(delta) < 120:
+            self.mousewheel_remainder = 0
+            return -1 if delta > 0 else 1
+        self.mousewheel_remainder += delta
+        steps = int(self.mousewheel_remainder / 120)
+        self.mousewheel_remainder -= steps * 120
+        return -steps * 3
 
     def ensure_visible(self, idx):
         if not self.albums or idx >= len(self.albums):
@@ -2926,6 +3837,7 @@ def main():
             try:
                 app.stop_key_repeat()
                 app.stop_mpd_idle_thread()
+                app.stop_hydrate_tail()
             except Exception:
                 pass
         logging.info("Gridmode shutdown")

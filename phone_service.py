@@ -4,6 +4,7 @@ import posixpath
 import shlex
 import subprocess
 import time
+import re
 
 
 AUDIO_EXTENSIONS = (
@@ -20,6 +21,18 @@ AUDIO_EXTENSIONS = (
 
 class PhoneTransferCancelled(RuntimeError):
     pass
+
+
+def lossy_album_match_key(name):
+    name = os.path.basename(str(name or ""))
+    name = re.sub(r"\\+", "", name)
+    name = re.sub(r"\[[^\]]*\]", " ", name)
+    name = re.sub(r"\{[^}]*\}", " ", name)
+    name = re.sub(r"\((?:19|20)\d{2}[^)]*\)", " ", name)
+    name = re.sub(r"\b(?:19|20)\d{2}\b", " ", name)
+    name = re.sub(r"\b(?:web|cd|vinyl|flac|mp3|lossy|v0|vbr|320|24bit|16bit)\b", " ", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^0-9a-zA-Z]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip().casefold()
 
 
 def _check_cancel(cancel_event):
@@ -104,6 +117,75 @@ done
     return albums
 
 
+def list_phone_album_tracks(transfer_ssh_host, phone_ssh_host, phone_root, album_names, timeout=120):
+    if not transfer_ssh_host:
+        raise ValueError("phone track listing requires music.ssh_host")
+    if not phone_ssh_host:
+        raise ValueError("phone track listing requires phone.ssh_host")
+    if not phone_root:
+        raise ValueError("phone track listing requires phone.music_root")
+
+    safe_album_names = []
+    for name in album_names:
+        name = str(name or "")
+        if not name or name in (".", "..") or "/" in name or name.startswith("."):
+            continue
+        safe_album_names.append(name)
+
+    if not safe_album_names:
+        return {}
+
+    script = r"""
+root=$1
+shift
+[ -d "$root" ] || exit 2
+cd "$root" || exit 2
+for album in "$@"; do
+    case "$album" in ""|"."|".."|/*|*/*|.*) continue;; esac
+    [ -d "$album" ] || continue
+    find "$album" -type f \( \
+        -iname '*.mp3' -o \
+        -iname '*.flac' -o \
+        -iname '*.m4a' -o \
+        -iname '*.ogg' -o \
+        -iname '*.opus' -o \
+        -iname '*.wav' -o \
+        -iname '*.aiff' -o \
+        -iname '*.aif' \
+    \) | sort | while IFS= read -r track; do
+        printf '%s\t%s\n' "$album" "$track"
+    done
+done
+"""
+    phone_cmd = "sh -c {} gridmode-list-phone-tracks {} {}".format(
+        shlex.quote(script),
+        shlex.quote(phone_root),
+        " ".join(shlex.quote(name) for name in safe_album_names),
+    )
+    transfer_cmd = "ssh -o BatchMode=yes {} {}".format(
+        shlex.quote(phone_ssh_host),
+        shlex.quote(phone_cmd),
+    )
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"ssh exited {proc.returncode}")
+
+    tracks = {name: [] for name in safe_album_names}
+    for line in proc.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        album, track = line.split("\t", 1)
+        if album in tracks and track:
+            tracks[album].append(track)
+    return tracks
+
+
 def prepare_album_for_phone(
     music_ssh_host,
     music_root,
@@ -131,6 +213,7 @@ def prepare_album_for_phone(
     script = r"""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -152,8 +235,48 @@ if not source.startswith(os.path.normpath(music_root) + os.sep):
 if not os.path.isdir(source):
     raise SystemExit("source album directory not found: " + source)
 
-def result(path, kind, created=False):
-    json.dump({"path": path, "kind": kind, "created": created}, sys.stdout)
+def result(path, kind, created=False, matched=False):
+    json.dump({"path": path, "kind": kind, "created": created, "matched": matched}, sys.stdout)
+
+def lossy_match_key(name):
+    name = os.path.basename(str(name or ""))
+    name = re.sub(r"\\+", "", name)
+    name = re.sub(r"\[[^\]]*\]", " ", name)
+    name = re.sub(r"\{[^}]*\}", " ", name)
+    name = re.sub(r"\((?:19|20)\d{2}[^)]*\)", " ", name)
+    name = re.sub(r"\b(?:19|20)\d{2}\b", " ", name)
+    name = re.sub(r"\b(?:web|cd|vinyl|flac|mp3|lossy|v0|vbr|320|24bit|16bit)\b", " ", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^0-9a-zA-Z]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip().casefold()
+
+def has_phone_audio(path):
+    for current, dirs, files in os.walk(path):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            if os.path.splitext(name)[1].casefold() in COPY_AS_IS:
+                return True
+    return False
+
+def find_existing_lossy():
+    rel_parent = os.path.dirname(rel_dir)
+    source_leaf = os.path.basename(rel_dir)
+    lossy_parent = os.path.normpath(os.path.join(lossy_root, rel_parent))
+    if not lossy_parent.startswith(os.path.normpath(lossy_root)):
+        return ""
+    wanted = lossy_match_key(source_leaf)
+    if not wanted or not os.path.isdir(lossy_parent):
+        return ""
+    for name in sorted(os.listdir(lossy_parent)):
+        if name.startswith("."):
+            continue
+        candidate = os.path.normpath(os.path.join(lossy_parent, name))
+        if not candidate.startswith(os.path.normpath(lossy_root) + os.sep):
+            continue
+        if os.path.isdir(candidate) and lossy_match_key(name) == wanted and has_phone_audio(candidate):
+            return candidate
+    return ""
 
 if not prefer_lossy:
     result(source, "source")
@@ -168,6 +291,12 @@ if not lossy.startswith(os.path.normpath(lossy_root) + os.sep):
 if os.path.isdir(lossy):
     result(lossy, "lossy")
     raise SystemExit(0)
+
+matched_lossy = find_existing_lossy()
+if matched_lossy:
+    result(matched_lossy, "lossy", matched=True)
+    raise SystemExit(0)
+
 if not transcode_missing:
     raise SystemExit("lossy album not found: " + lossy)
 
@@ -258,6 +387,96 @@ def copy_remote_album_to_phone(
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"rsync exited {proc.returncode}")
     return {"name": leaf, "destination": f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}"}
+
+
+def phone_album_dir_exists(transfer_ssh_host, phone_ssh_host, phone_root, album_name, timeout=60, cancel_event=None):
+    if not transfer_ssh_host:
+        raise ValueError("phone exists check requires music.ssh_host")
+    if not phone_ssh_host:
+        raise ValueError("phone exists check requires phone.ssh_host")
+    if not phone_root:
+        raise ValueError("phone exists check requires phone.music_root")
+    if not album_name or "/" in album_name or album_name in (".", ".."):
+        raise ValueError("phone exists check requires one album directory name")
+
+    script = r"""
+root=$1
+name=$2
+[ -d "$root/$name" ]
+"""
+    phone_cmd = "sh -c {} gridmode-phone-exists {} {}".format(
+        shlex.quote(script),
+        shlex.quote(phone_root),
+        shlex.quote(album_name),
+    )
+    transfer_cmd = "ssh -o BatchMode=yes {} {}".format(
+        shlex.quote(phone_ssh_host),
+        shlex.quote(phone_cmd),
+    )
+    proc = _run_cancelable(
+        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        timeout,
+        cancel_event,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"phone exists check exited {proc.returncode}")
+
+
+def delete_phone_album_dir(transfer_ssh_host, phone_ssh_host, phone_root, phone_rel_dir, timeout=120):
+    if not transfer_ssh_host:
+        raise ValueError("phone delete requires music.ssh_host")
+    if not phone_ssh_host:
+        raise ValueError("phone delete requires phone.ssh_host")
+    if not phone_root:
+        raise ValueError("phone delete requires phone.music_root")
+    if not phone_rel_dir:
+        raise ValueError("phone delete requires a selected album directory")
+
+    script = r"""
+root=$1
+rel_dir=$2
+case "$rel_dir" in
+    ""|"."|".."|/*|*/*)
+        printf '%s\n' "bad phone album path" >&2
+        exit 2
+        ;;
+esac
+[ -d "$root" ] || { printf '%s\n' "phone music root not found: $root" >&2; exit 2; }
+cd "$root" || exit 2
+[ -d "$rel_dir" ] || { printf '%s\n' "phone album not found: $rel_dir" >&2; exit 2; }
+[ ! -L "$rel_dir" ] || { printf '%s\n' "phone album is a symlink: $rel_dir" >&2; exit 2; }
+rm -rf -- "$rel_dir" || exit 1
+printf '%s\t%s\n' "deleted" "$rel_dir"
+"""
+    phone_cmd = "sh -c {} gridmode-delete-phone {} {}".format(
+        shlex.quote(script),
+        shlex.quote(phone_root),
+        shlex.quote(phone_rel_dir),
+    )
+    transfer_cmd = "ssh -o BatchMode=yes {} {}".format(
+        shlex.quote(phone_ssh_host),
+        shlex.quote(phone_cmd),
+    )
+    proc = _run_cancelable(
+        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        timeout,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"phone delete exited {proc.returncode}")
+    line = proc.stdout.strip()
+    status, _, name = line.partition("\t")
+    if status != "deleted" or not name:
+        raise RuntimeError(line or "bad phone delete output")
+    return {"deleted": True, "name": name, "rel_dir": phone_rel_dir}
 
 
 def copy_local_cover_to_remote_album(

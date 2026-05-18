@@ -9,6 +9,7 @@ import sys
 import time
 
 from gridmode_cache import (
+    AlbumRecord,
     DEFAULT_USER_AGENT,
     RateLimiter,
     connect_mpd,
@@ -34,6 +35,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Hydrate Gridmode's local album cover cache.")
     parser.add_argument("config", nargs="?", default=DEFAULT_CONFIG)
     parser.add_argument("--playlist", action="store_true", help="hydrate only the current MPD playlist")
+    parser.add_argument("--library-index", action="store_true", help="hydrate from cache/library_index.json instead of scanning MPD")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many missing covers are attempted")
     parser.add_argument("--music-root", default=None, help="music root matching MPD file paths")
     parser.add_argument("--ssh-host", default=None, help="SSH host for reading remote local art; empty disables SSH")
@@ -69,6 +71,36 @@ def load_records(cfg, playlist=False):
             pass
 
 
+def load_library_index_records(cache_dir):
+    path = os.path.join(cache_dir, "library_index.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    records = []
+    for item in data.get("albums", []):
+        key = item.get("key")
+        if not isinstance(key, list):
+            continue
+        artist = str(item.get("artist", "")).strip()
+        album = str(item.get("album", "")).strip()
+        if not artist or not album:
+            continue
+        records.append(
+            AlbumRecord(
+                artist=artist,
+                album=album,
+                key=tuple(str(part) for part in key),
+                rel_dir=str(item.get("rel_dir", "")),
+            )
+        )
+    return records
+
+
 def main():
     args = parse_args()
     cfg = config_to_mapping(load_app_config(args.config))
@@ -87,7 +119,20 @@ def main():
     ssh_host_arg = args.ssh_host if args.ssh_host is not None else music_cfg.get("ssh_host", "")
     log_path = "" if args.no_log else expand_path(args.log_file or os.path.join(cache_dir, "hydrate.log"))
 
-    records = load_records(cfg, playlist=args.playlist)
+    log = HydrateLog(log_path)
+    log.write(f"hydrate started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if log_path:
+        log.write(f"log: {log_path}")
+    if args.library_index:
+        log.write("loading album records from cached library index")
+        records = load_library_index_records(cache_dir)
+        if not records:
+            log.write("cached library index is empty; loading album records from MPD")
+            records = load_records(cfg, playlist=args.playlist)
+    else:
+        log.write("loading album records from MPD; this can take a moment")
+        records = load_records(cfg, playlist=args.playlist)
+    log.write("checking cover cache and known failures")
     index = load_index(cache_dir)
     known_failures = load_failures(cache_dir)
     limiter = RateLimiter(min_interval=min_interval, max_backoff=args.max_backoff)
@@ -117,10 +162,6 @@ def main():
     if args.limit:
         work_items = work_items[: args.limit]
 
-    log = HydrateLog(log_path)
-    log.write(f"hydrate started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    if log_path:
-        log.write(f"log: {log_path}")
     log.write(f"albums: {len(records)}")
     log.write(f"cached: {cached}")
     log.write(f"known failures skipped: {skipped_failed}")
