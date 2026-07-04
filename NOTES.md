@@ -29,7 +29,11 @@ Current direction:
   `r`, `:hydrate`, and Tools.
 - `:` opens a command prompt for operations that do not deserve a top-level key.
   Useful commands should include aliases, e.g. `tools`, `refresh`, `hydrate`,
-  and `sick-tunes`.
+  `follow`, `fullscreen`, and `sick-tunes`.
+- `f` toggles follow mode. In follow mode, Queue/Library selections follow the
+  currently playing album, and Now Playing/Info views keep the current song and
+  album visible as playback advances. Fullscreen remains available through
+  `:fullscreen` / `:fs`.
 - Tools is a transient tab for maintenance. Navigate with `j/k`, jump sections
   with `J/K`, and run with Enter. Planned/destructive/global actions should be
   listed there before receiving top-level bindings.

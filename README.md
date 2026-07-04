@@ -185,9 +185,10 @@ is written to `hydrate.log` in the configured cache directory by default; use
 - `d`: remove selected Queue album occurrence from the current MPD playlist.
 - `r`: refresh the active tab; offers targeted missing-cover hydration.
 - `t`: add the current song to `sick_tunes`.
-- `:`: command prompt; try `tools`, `refresh`, `hydrate`, or `sick-tunes`.
+- `f`: toggle follow mode, which keeps Queue/Library/Now Playing focused on playback.
+- `:`: command prompt; try `tools`, `refresh`, `hydrate`, `follow`, `fullscreen`, or `sick-tunes`.
 - `?`: open/close Help.
-- `f`: toggle fullscreen.
+- `Esc`: exit fullscreen.
 - `q`: close transient tab or quit.
 
 ## Development Notes

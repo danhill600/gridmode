@@ -268,6 +268,8 @@ class GridModeApp:
         self.view_selected_indices = {view: 0 for view in self.grid_views}
         self.view_grid_cache = {}
         self.pending_leader = None
+        self.follow_mode = False
+        self.follow_last_album_key = None
         self.current_playlist_name = None
         self.library_search_query = ""
         self.library_search_matches = []
@@ -524,7 +526,7 @@ class GridModeApp:
         self.root.bind_all("i", self.global_key(lambda e: self.toggle_info_tab()))
         self.root.bind_all("o", self.global_key(lambda e: self.jump_to_current_album()))
         self.root.bind_all("?", self.global_key(lambda e: self.show_key_help()))
-        self.root.bind("f", lambda e: self.toggle_fullscreen())
+        self.root.bind_all("f", self.global_key(lambda e: self.toggle_follow_mode()))
         self.root.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.root.bind("r", lambda e: self.refresh_from_key())
         self.root.bind_all("q", self.global_key(lambda e: self.close_info_or_quit()))
@@ -797,8 +799,10 @@ class GridModeApp:
         if "playlist" in events:
             self.view_loaded["queue"] = False
             self.view_grid_cache.pop("queue", None)
-        if self.active_view == "nowplaying" and ({"player", "playlist"} & events):
-            self.refresh_nowplaying()
+        if self.follow_mode and ({"player", "playlist"} & events):
+            self.follow_current_playback()
+        elif self.active_view == "nowplaying" and ({"player", "playlist"} & events):
+            self.refresh_nowplaying(force_current_track=self.follow_mode)
 
     def stop_mpd_idle_thread(self):
         self.mpd_idle_stop.set()
@@ -1843,9 +1847,11 @@ json.dump(out, sys.stdout)
             msg += " | no ImageMagick"
         if self.active_view in self.grid_views and self.marked_grid_items.get(self.active_view):
             msg += f" | marked {len(self.marked_items_for_view(self.active_view))}"
+        if self.follow_mode:
+            msg += " | follow"
         if note:
             msg += f" | {note}"
-        msg += " | 1-6 tabs, Enter=add/select, m=mark, d=delete/remove, p=send to phone, t=sick tunes, :=command, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh tab, q=quit"
+        msg += " | 1-6 tabs, Enter=add/select, m=mark, d=delete/remove, p=send to phone, t=sick tunes, :=command, o=now playing, f=follow, Esc=exit fullscreen, r=refresh tab, q=quit"
         self.status.configure(text=msg)
 
     def set_fullscreen(self, enabled):
@@ -1856,6 +1862,17 @@ json.dump(out, sys.stdout)
 
     def toggle_fullscreen(self):
         self.set_fullscreen(not self.fullscreen)
+
+    def toggle_follow_mode(self):
+        self.follow_mode = not self.follow_mode
+        if self.follow_mode:
+            self.follow_last_album_key = None
+            self.follow_current_playback()
+            self.update_status("follow mode on")
+        else:
+            self.follow_last_album_key = None
+            self.update_status("follow mode off")
+        return "break"
 
     def close_info_or_quit(self):
         if self.active_view == "help":
@@ -1964,6 +1981,9 @@ json.dump(out, sys.stdout)
             "covers": "hydrate",
             "hydrate-covers": "hydrate",
             "u": "hydrate",
+            "follow-mode": "follow",
+            "fs": "fullscreen",
+            "full-screen": "fullscreen",
             "sick": "sick-tunes",
             "sick-tune": "sick-tunes",
             "sicktunes": "sick-tunes",
@@ -1976,6 +1996,11 @@ json.dump(out, sys.stdout)
             return self.refresh_from_key()
         if name == "hydrate":
             return self.confirm_hydrate_covers()
+        if name == "follow":
+            return self.toggle_follow_mode()
+        if name == "fullscreen":
+            self.toggle_fullscreen()
+            return "break"
         if name == "sick-tunes":
             return self.append_current_song_to_sick_tunes()
         if not name:
@@ -2542,8 +2567,8 @@ json.dump(out, sys.stdout)
                 "  p          send selected album to phone and show Transfers",
                 "  c          cancel active transfer from Transfers",
                 "  t          add current song to sick_tunes",
-                "  :          command prompt; try tools, refresh, hydrate, sick-tunes",
-                "  f          toggle fullscreen",
+                "  f          toggle follow mode",
+                "  :          command prompt; try tools, refresh, hydrate, follow, fullscreen, sick-tunes",
                 "  Esc        exit fullscreen",
                 "  ?          show this help",
                 "  q          quit, except Info where it closes Info",
@@ -2723,6 +2748,12 @@ json.dump(out, sys.stdout)
             return
         if self.active_view == "info":
             return
+        song = self.load_current_song_for_status()
+        if not song:
+            return
+        self.select_current_album_in_grid(song, update_last_follow=False)
+
+    def load_current_song_for_status(self):
         mpd_host = require_cfg(self.cfg, "mpd", "host")
         mpd_port = require_cfg(self.cfg, "mpd", "port")
         mpd_password = self.cfg.get("mpd", {}).get("password", "")
@@ -2740,15 +2771,19 @@ json.dump(out, sys.stdout)
         except Exception as e:
             logging.exception("Failed to read current song from MPD")
             self.update_status(f"mpd error: {e}")
-            return
+            return None
+        return song
 
+    def select_current_album_in_grid(self, song, update_last_follow=True):
         artist = _tag_to_str(song.get("artist", "")).strip()
         album = _tag_to_str(song.get("album", "")).strip()
         if not artist or not album:
             self.update_status("now playing has no album")
-            return
+            return False
 
         current_key = album_group_key(song)
+        if update_last_follow and current_key is not None and current_key == self.follow_last_album_key:
+            return False
         for idx, grid_key in enumerate(self.album_keys):
             if grid_key == current_key:
                 if idx != self.selected_index:
@@ -2756,10 +2791,31 @@ json.dump(out, sys.stdout)
                     self.update_selection()
                 else:
                     self.ensure_visible(idx)
+                if update_last_follow:
+                    self.follow_last_album_key = current_key
                 self.update_status(f"now playing: {artist} - {album}")
-                return
+                return True
 
         self.update_status(f"now playing not in grid: {artist} - {album}")
+        if update_last_follow:
+            self.follow_last_album_key = current_key
+        return False
+
+    def follow_current_playback(self):
+        if self.active_view == "nowplaying":
+            self.refresh_nowplaying(force_current_track=True)
+            return
+        if self.active_view == "info":
+            self.refresh_info_to_nowplaying()
+            return
+        if self.active_view not in ("queue", "library"):
+            return
+        if self.active_view == "queue" and not self.view_loaded.get("queue"):
+            self.refresh()
+        song = self.load_current_song_for_status()
+        if not song:
+            return
+        self.select_current_album_in_grid(song, update_last_follow=True)
 
     def select_current_nowplaying_track(self):
         info = self.nowplaying_info
@@ -2776,7 +2832,7 @@ json.dump(out, sys.stdout)
         self.track_selection_manual["nowplaying"] = False
         self.update_track_highlight()
 
-    def refresh_nowplaying(self):
+    def refresh_nowplaying(self, force_current_track=False):
         try:
             info = self.load_nowplaying_info()
         except Exception as e:
@@ -2789,7 +2845,10 @@ json.dump(out, sys.stdout)
             return
 
         previous = self.nowplaying_info
-        if previous and previous.get("key") == info.get("key"):
+        if force_current_track:
+            self.track_selected_indices["nowplaying"] = self.current_track_index(info)
+            self.track_selection_manual["nowplaying"] = False
+        elif previous and previous.get("key") == info.get("key"):
             if self.track_selection_manual.get("nowplaying", False):
                 self.track_selected_indices["nowplaying"] = min(
                     self.track_selected_indices.get("nowplaying", 0),
@@ -2801,6 +2860,37 @@ json.dump(out, sys.stdout)
             self.track_selected_indices["nowplaying"] = 0
             self.track_selection_manual["nowplaying"] = False
         self.nowplaying_info = info
+        self.render_nowplaying(info)
+        self.update_status(f"{info['artist']} - {info['album']}")
+
+    def refresh_info_to_nowplaying(self):
+        try:
+            info = self.load_nowplaying_info()
+        except Exception as e:
+            logging.exception("Failed to load now playing info for follow mode")
+            self.update_nowplaying_empty(f"mpd error: {e}")
+            return
+        if not info:
+            self.update_nowplaying_empty("nothing playing")
+            return
+        if self.follow_last_album_key is not None and info.get("key") == self.follow_last_album_key:
+            self.track_selected_indices["info"] = self.current_track_index(info)
+            self.track_selection_manual["info"] = False
+            self.info_info = info
+            self.render_nowplaying(info)
+            self.update_status(f"{info['artist']} - {info['album']}")
+            return
+        self.follow_last_album_key = info.get("key")
+        self.info_album = {
+            "artist": info.get("artist", ""),
+            "album": info.get("album", ""),
+            "key": info.get("key"),
+            "rel_dir": info.get("rel_dir", ""),
+        }
+        self.info_info = info
+        self.track_selected_indices["info"] = self.current_track_index(info)
+        self.track_selection_manual["info"] = False
+        self.text_pane_focus["info"] = "tracks"
         self.render_nowplaying(info)
         self.update_status(f"{info['artist']} - {info['album']}")
 
