@@ -152,6 +152,10 @@ def library_index_path(cache_dir):
     return os.path.join(cache_dir, "library_index.json")
 
 
+def phone_index_path(cache_dir):
+    return os.path.join(cache_dir, "phone_index.json")
+
+
 def artist_bios_path(cache_dir):
     return os.path.join(cache_dir, "artist_bios.json")
 
@@ -215,6 +219,7 @@ class GridModeApp:
         self.nowplaying_profile = None
         self.nowplaying_profiles = self.build_nowplaying_profiles()
         self.help_font = tkfont.Font(font=cfg.get("ui", {}).get("help_font", "Courier 11"))
+        self.help_heading_font = tkfont.Font(font=cfg.get("ui", {}).get("help_heading_font", "Courier 11 bold"))
         self.loading_font = tkfont.Font(font=cfg.get("ui", {}).get("loading_font", "Courier 18 bold"))
         self.selected_index = 0
         self.last_selected_index = None
@@ -271,6 +276,10 @@ class GridModeApp:
         self.hydrate_tab_visible = False
         self.hydrate_return_view = "library"
         self.hydrate_target_view = "library"
+        self.tools_tab_visible = False
+        self.tools_return_view = "queue"
+        self.tools_selected_index = 0
+        self.refresh_hydrate_after_load = None
         self.hydrate_process = None
         self.hydrate_tail_after_id = None
         self.hydrate_log_path = os.path.join(self.cache_dir, "hydrate.log")
@@ -294,6 +303,7 @@ class GridModeApp:
         self.help_tab = ttk.Frame(self.tabs)
         self.hydrate_tab = ttk.Frame(self.tabs)
         self.transfers_tab = ttk.Frame(self.tabs)
+        self.tools_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.queue_tab, text="Queue")
         self.tabs.add(self.library_tab, text="Library")
         if self.phone_enabled:
@@ -353,6 +363,24 @@ class GridModeApp:
         )
         self.hydrate_text.pack(fill="both", expand=True)
         self.hydrate_text.configure(state="disabled")
+
+        self.tools_frame = ttk.Frame(self.content, padding=12)
+        self.tools_text = tk.Text(
+            self.tools_frame,
+            wrap="none",
+            bg=PANEL_BG,
+            fg=APP_FG,
+            insertbackground=APP_FG,
+            relief="flat",
+            padx=12,
+            pady=12,
+            font=self.help_font,
+        )
+        self.tools_text.tag_configure("section", foreground=APP_ACCENT, font=self.help_heading_font)
+        self.tools_text.tag_configure("selected", background="#12323a", foreground="#fdf6e3")
+        self.tools_text.tag_configure("disabled", foreground="#586e75")
+        self.tools_text.pack(fill="both", expand=True)
+        self.tools_text.configure(state="disabled")
 
         self.transfers_frame = ttk.Frame(self.content, padding=12)
         self.transfers_text = tk.Text(
@@ -449,6 +477,7 @@ class GridModeApp:
         self.bind_mousewheel(self.bio_text)
         self.bind_mousewheel(self.help_text)
         self.bind_mousewheel(self.hydrate_text)
+        self.bind_mousewheel(self.tools_text)
         self.bind_mousewheel(self.transfers_text)
 
         arrow_intercepts = (self.tabs, self.canvas, self.track_text, self.bio_text)
@@ -473,7 +502,7 @@ class GridModeApp:
         self.root.bind_all("s", self.global_key(lambda e: self.save_current_playlist()))
         self.root.bind_all("S", self.global_key(lambda e: self.save_current_playlist_as()))
         self.root.bind_all("t", self.global_key(lambda e: self.append_current_song_to_sick_tunes()))
-        self.root.bind_all("u", self.global_key(lambda e: self.confirm_hydrate_covers()))
+        self.root.bind_all(":", self.global_key(lambda e: self.command_prompt()))
         self.root.bind_all("c", self.global_key(lambda e: self.cancel_phone_transfer_from_key()))
         self.root.bind_all("m", self.global_key(lambda e: self.toggle_phone_mark()))
         self.root.bind_all("/", self.global_key(lambda e: self.begin_library_search()))
@@ -804,7 +833,10 @@ class GridModeApp:
     def refresh_from_key(self):
         if self.search_entry.winfo_ismapped():
             return "break"
+        self.refresh_hydrate_after_load = self.active_view if self.active_view in self.grid_views else None
         self.refresh(rebuild=True)
+        if self.active_view == "queue":
+            self.maybe_offer_hydrate_after_refresh("queue")
         return "break"
 
     def prepare_active_grid(self, use_cache=True):
@@ -913,16 +945,106 @@ class GridModeApp:
 
     def phone_library_lookup(self):
         lookup = {}
+        for item in self.load_phone_index():
+            self.add_phone_lookup_item(lookup, item, override=True)
+        for view in ("queue", "library"):
+            for item in self.view_items.get(view, []):
+                self.add_phone_lookup_item(lookup, item, override=False)
         for item in self.load_library_index():
-            rel_dir = item.get("rel_dir", "")
-            if not rel_dir:
-                continue
-            lookup[rel_dir] = item
-            lookup.setdefault(os.path.basename(rel_dir), item)
-            normalized = phone_folder_match_key(rel_dir)
-            if normalized:
-                lookup.setdefault(normalized, item)
+            self.add_phone_lookup_item(lookup, item, override=False)
         return lookup
+
+    def add_phone_lookup_item(self, lookup, item, override=False):
+        keys = []
+        phone_rel_dir = item.get("phone_rel_dir") or item.get("phone_name")
+        if phone_rel_dir:
+            keys.extend([phone_rel_dir, os.path.basename(phone_rel_dir)])
+        rel_dir = item.get("rel_dir", "")
+        if rel_dir:
+            keys.extend([rel_dir, os.path.basename(rel_dir)])
+        for key in keys:
+            if not key:
+                continue
+            if override:
+                lookup[key] = item
+            else:
+                lookup.setdefault(key, item)
+            normalized = phone_folder_match_key(key)
+            if normalized:
+                if override:
+                    lookup[normalized] = item
+                else:
+                    lookup.setdefault(normalized, item)
+
+    def load_phone_index(self):
+        path = phone_index_path(self.cache_dir)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            logging.exception("Failed to load phone index")
+            return []
+        items = data.get("albums", [])
+        if not isinstance(items, list):
+            return []
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            album_item = deserialize_library_item(item)
+            album_item["phone_rel_dir"] = str(item.get("phone_rel_dir", "") or "")
+            album_item["phone_name"] = str(item.get("phone_name", "") or os.path.basename(album_item["phone_rel_dir"]))
+            out.append(album_item)
+        return out
+
+    def save_phone_index(self, items):
+        path = phone_index_path(self.cache_dir)
+        tmp_path = path + ".tmp"
+        payload = {
+            "version": 1,
+            "generated_at": time.time(),
+            "albums": [self.serialize_phone_index_item(item) for item in items],
+        }
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except OSError:
+            logging.exception("Failed to save phone index")
+
+    def serialize_phone_index_item(self, item):
+        out = serialize_library_item(item)
+        out["phone_rel_dir"] = item.get("phone_rel_dir", "")
+        out["phone_name"] = item.get("phone_name", "")
+        return out
+
+    def remember_phone_index_item(self, item, copied):
+        phone_name = str((copied or {}).get("name") or item.get("phone_name") or "")
+        phone_rel_dir = str((copied or {}).get("rel_dir") or phone_name)
+        if not phone_rel_dir:
+            return
+        remembered = dict(item)
+        remembered["phone_rel_dir"] = phone_rel_dir
+        remembered["phone_name"] = phone_name or os.path.basename(phone_rel_dir)
+        existing = [
+            old for old in self.load_phone_index()
+            if (old.get("phone_rel_dir") or old.get("phone_name")) != phone_rel_dir
+        ]
+        existing.append(remembered)
+        self.save_phone_index(existing)
+
+    def forget_phone_index_items(self, rel_dirs):
+        rel_dir_set = {str(rel_dir or "") for rel_dir in rel_dirs if rel_dir}
+        if not rel_dir_set:
+            return
+        items = [
+            item for item in self.load_phone_index()
+            if (item.get("phone_rel_dir") or item.get("phone_name")) not in rel_dir_set
+        ]
+        self.save_phone_index(items)
 
     def load_library_items(self, rebuild=False):
         cached_items = self.load_library_index()
@@ -1073,6 +1195,12 @@ json.dump(out, sys.stdout)
             self.update_status()
             self.start_hydrate_tail()
             return
+        if tab_text == "Tools":
+            self.active_view = "tools"
+            self.show_tools_panel()
+            self.render_tools()
+            self.update_status()
+            return
         if tab_text == "Transfers":
             self.active_view = "transfers"
             self.show_transfers_panel()
@@ -1101,6 +1229,7 @@ json.dump(out, sys.stdout)
         self.help_frame.pack_forget()
         self.nowplaying_frame.pack_forget()
         self.hydrate_frame.pack_forget()
+        self.tools_frame.pack_forget()
         self.transfers_frame.pack_forget()
         if not self.canvas.winfo_ismapped():
             self.canvas.pack(side="left", fill="both", expand=True)
@@ -1108,6 +1237,7 @@ json.dump(out, sys.stdout)
     def show_nowplaying_panel(self):
         self.help_frame.pack_forget()
         self.hydrate_frame.pack_forget()
+        self.tools_frame.pack_forget()
         self.transfers_frame.pack_forget()
         self.canvas.pack_forget()
         if not self.nowplaying_frame.winfo_ismapped():
@@ -1117,6 +1247,7 @@ json.dump(out, sys.stdout)
         self.canvas.pack_forget()
         self.nowplaying_frame.pack_forget()
         self.hydrate_frame.pack_forget()
+        self.tools_frame.pack_forget()
         self.transfers_frame.pack_forget()
         if not self.help_frame.winfo_ismapped():
             self.help_frame.pack(side="top", fill="both", expand=True)
@@ -1125,15 +1256,26 @@ json.dump(out, sys.stdout)
         self.canvas.pack_forget()
         self.nowplaying_frame.pack_forget()
         self.help_frame.pack_forget()
+        self.tools_frame.pack_forget()
         self.transfers_frame.pack_forget()
         if not self.hydrate_frame.winfo_ismapped():
             self.hydrate_frame.pack(side="top", fill="both", expand=True)
+
+    def show_tools_panel(self):
+        self.canvas.pack_forget()
+        self.nowplaying_frame.pack_forget()
+        self.help_frame.pack_forget()
+        self.hydrate_frame.pack_forget()
+        self.transfers_frame.pack_forget()
+        if not self.tools_frame.winfo_ismapped():
+            self.tools_frame.pack(side="top", fill="both", expand=True)
 
     def show_transfers_panel(self):
         self.canvas.pack_forget()
         self.nowplaying_frame.pack_forget()
         self.help_frame.pack_forget()
         self.hydrate_frame.pack_forget()
+        self.tools_frame.pack_forget()
         if not self.transfers_frame.winfo_ismapped():
             self.transfers_frame.pack(side="top", fill="both", expand=True)
 
@@ -1166,6 +1308,7 @@ json.dump(out, sys.stdout)
             "nowplaying": "Now Playing",
             "info": "Info",
             "hydrate": "Hydrate",
+            "tools": "Tools",
             "transfers": "Transfers",
         }
         wanted = labels.get(view)
@@ -1337,6 +1480,7 @@ json.dump(out, sys.stdout)
         self.apply_grid_cache("library")
         self.reset_images()
         self.render_grid()
+        self.maybe_offer_hydrate_after_refresh("library")
         logging.info(
             "Loaded %d library albums; covers cached=%d missing=%d",
             len(self.albums),
@@ -1370,6 +1514,7 @@ json.dump(out, sys.stdout)
         self.apply_grid_cache("phone")
         self.reset_images()
         self.render_grid()
+        self.maybe_offer_hydrate_after_refresh("phone")
         logging.info(
             "Loaded %d phone albums; covers cached=%d missing=%d",
             len(self.albums),
@@ -1657,7 +1802,18 @@ json.dump(out, sys.stdout)
             if note:
                 msg += f" | {note}"
             msg += " | running" if running else " | idle"
-            msg += " | u=start hydrate, q=close hydrate"
+            msg += " | q=close hydrate"
+            self.status.configure(text=msg)
+            return
+        if self.active_view == "tools":
+            items = self.tools_items()
+            item = items[self.tools_selected_index] if 0 <= self.tools_selected_index < len(items) else {}
+            msg = f"Tools: {item.get('label', 'select an action')}"
+            if item.get("type") == "disabled":
+                msg += " [planned]"
+            if note:
+                msg += f" | {note}"
+            msg += " | j/k move, J/K section, Enter run, q close"
             self.status.configure(text=msg)
             return
         if self.active_view == "transfers":
@@ -1689,7 +1845,7 @@ json.dump(out, sys.stdout)
             msg += f" | marked {len(self.marked_items_for_view(self.active_view))}"
         if note:
             msg += f" | {note}"
-        msg += " | 1-6 tabs, Enter=add/select, m=mark, d=delete/remove, p=send to phone, u=hydrate, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh, q=quit"
+        msg += " | 1-6 tabs, Enter=add/select, m=mark, d=delete/remove, p=send to phone, t=sick tunes, :=command, o=now playing, f=fullscreen, Esc=exit fullscreen, r=refresh tab, q=quit"
         self.status.configure(text=msg)
 
     def set_fullscreen(self, enabled):
@@ -1707,6 +1863,9 @@ json.dump(out, sys.stdout)
             return "break"
         if self.active_view == "hydrate":
             self.close_hydrate_tab()
+            return "break"
+        if self.active_view == "tools":
+            self.close_tools_tab()
             return "break"
         if self.active_view == "transfers":
             self.close_transfers_tab()
@@ -1736,6 +1895,19 @@ json.dump(out, sys.stdout)
         self.tabs.select(self.hydrate_tab)
         return "break"
 
+    def toggle_tools_tab(self):
+        if self.active_view == "tools":
+            return self.close_tools_tab()
+        return self.show_tools_tab()
+
+    def show_tools_tab(self):
+        self.tools_return_view = self.active_view if self.active_view in (*self.grid_views, "nowplaying", "info") else "queue"
+        if not self.tools_tab_visible:
+            self.tabs.add(self.tools_tab, text="Tools")
+            self.tools_tab_visible = True
+        self.tabs.select(self.tools_tab)
+        return "break"
+
     def show_transfers_tab(self):
         self.transfer_return_view = self.active_view if self.active_view in (*self.grid_views, "nowplaying", "info", "hydrate") else "library"
         if not self.transfer_tab_visible:
@@ -1760,6 +1932,251 @@ json.dump(out, sys.stdout)
         self.select_view_tab(return_view)
         return "break"
 
+    def close_tools_tab(self):
+        return_view = self.tools_return_view if self.tools_return_view in (*self.grid_views, "nowplaying", "info") else "queue"
+        if self.tools_tab_visible:
+            self.tabs.hide(self.tools_tab)
+            self.tools_tab_visible = False
+        self.select_view_tab(return_view)
+        return "break"
+
+    def command_prompt(self):
+        if self.search_entry.winfo_ismapped():
+            return "break"
+        command = simpledialog.askstring(
+            "Gridmode command",
+            "Command:",
+            parent=self.root,
+        )
+        if command is None:
+            self.update_status("command cancelled")
+            return "break"
+        return self.run_command(command)
+
+    def run_command(self, command):
+        name = re.sub(r"[\s_-]+", "-", str(command or "").strip().casefold())
+        aliases = {
+            "tool": "tools",
+            "settings": "tools",
+            "maintenance": "tools",
+            "r": "refresh",
+            "cover": "hydrate",
+            "covers": "hydrate",
+            "hydrate-covers": "hydrate",
+            "u": "hydrate",
+            "sick": "sick-tunes",
+            "sick-tune": "sick-tunes",
+            "sicktunes": "sick-tunes",
+            "sick-tunes": "sick-tunes",
+        }
+        name = aliases.get(name, name)
+        if name == "tools":
+            return self.show_tools_tab()
+        if name == "refresh":
+            return self.refresh_from_key()
+        if name == "hydrate":
+            return self.confirm_hydrate_covers()
+        if name == "sick-tunes":
+            return self.append_current_song_to_sick_tunes()
+        if not name:
+            self.update_status("empty command")
+        else:
+            self.update_status(f"unknown command: {command}")
+        return "break"
+
+    def tools_items(self):
+        items = [
+            {"type": "section", "label": "Covers"},
+            {
+                "type": "action",
+                "id": "update_return_tab",
+                "label": "Refresh previous tab",
+                "detail": "Run the normal r flow for the tab you opened Tools from.",
+            },
+            {
+                "type": "action",
+                "id": "hydrate_return_tab",
+                "label": "Hydrate missing covers in previous tab",
+                "detail": "Run the targeted cover hydrate without first refreshing the tab.",
+            },
+            {
+                "type": "disabled",
+                "label": "Deep cover repair: retry known failures",
+                "detail": "Planned maintenance flow; global, slower, failure-aware.",
+            },
+            {
+                "type": "disabled",
+                "label": "Clear cover failure cache",
+                "detail": "Planned explicit destructive maintenance action.",
+            },
+            {"type": "section", "label": "Library"},
+            {
+                "type": "action",
+                "id": "rebuild_library",
+                "label": "Rebuild library index",
+                "detail": "Reload MPD library and rewrite library_index.json.",
+            },
+            {
+                "type": "disabled",
+                "label": "Recompute library mtimes",
+                "detail": "Planned diagnostic/maintenance action.",
+            },
+            {"type": "section", "label": "Phone"},
+            {
+                "type": "action",
+                "id": "refresh_phone",
+                "label": "Refresh phone albums",
+                "detail": "Relist phone folders and reconcile local identities.",
+                "enabled": self.phone_enabled,
+            },
+            {
+                "type": "disabled",
+                "label": "Rebuild phone identity index",
+                "detail": "Planned repair for phone_index.json.",
+            },
+            {
+                "type": "disabled",
+                "label": "Clear phone identity index",
+                "detail": "Planned explicit destructive maintenance action.",
+            },
+            {
+                "type": "disabled",
+                "label": "Test phone SSH",
+                "detail": "Planned connectivity diagnostic.",
+            },
+            {"type": "section", "label": "Logs"},
+            {
+                "type": "action",
+                "id": "open_hydrate_log",
+                "label": "Open Hydrate log",
+                "detail": "Show the Hydrate tab and tail hydrate.log.",
+            },
+        ]
+        return items
+
+    def selectable_tools_indices(self):
+        return [
+            idx for idx, item in enumerate(self.tools_items())
+            if item.get("type") == "action" and item.get("enabled", True)
+        ]
+
+    def render_tools(self):
+        items = self.tools_items()
+        selectable = self.selectable_tools_indices()
+        if selectable:
+            if self.tools_selected_index not in selectable:
+                self.tools_selected_index = selectable[0]
+        else:
+            self.tools_selected_index = 0
+
+        self.tools_text.configure(state="normal")
+        self.tools_text.delete("1.0", "end")
+        self.tools_text.insert("end", "Tools\n\n", ("section",))
+        self.tools_text.insert("end", "j/k move, J/K jump section, Enter run, q close\n\n")
+        for idx, item in enumerate(items):
+            line_start = self.tools_text.index("end")
+            if item["type"] == "section":
+                self.tools_text.insert("end", f"{item['label']}\n", ("section",))
+                continue
+            marker = "›" if idx == self.tools_selected_index else " "
+            disabled = item["type"] != "action" or not item.get("enabled", True)
+            suffix = " [planned]" if disabled else ""
+            tags = ("disabled",) if disabled else ()
+            self.tools_text.insert("end", f"{marker} {item['label']}{suffix}\n", tags)
+            if idx == self.tools_selected_index:
+                self.tools_text.tag_add("selected", line_start, f"{line_start} lineend")
+            detail = item.get("detail", "")
+            if detail:
+                self.tools_text.insert("end", f"    {detail}\n", ("disabled",))
+            self.tools_text.insert("end", "\n")
+        self.tools_text.configure(state="disabled")
+        self.tools_text.see(f"{self.tools_line_for_index(self.tools_selected_index)}.0")
+
+    def tools_line_for_index(self, target_index):
+        line = 5
+        for idx, item in enumerate(self.tools_items()):
+            if idx == target_index:
+                return line
+            if item["type"] == "section":
+                line += 1
+            else:
+                line += 3 if item.get("detail") else 2
+        return line
+
+    def move_tools_selection(self, direction):
+        selectable = self.selectable_tools_indices()
+        if not selectable:
+            return
+        try:
+            pos = selectable.index(self.tools_selected_index)
+        except ValueError:
+            pos = 0
+        pos = max(0, min(len(selectable) - 1, pos + direction))
+        self.tools_selected_index = selectable[pos]
+        self.render_tools()
+        self.update_status()
+
+    def move_tools_section(self, direction):
+        items = self.tools_items()
+        selectable = self.selectable_tools_indices()
+        if not selectable:
+            return
+        current = self.tools_selected_index
+        section_starts = [
+            idx for idx, item in enumerate(items)
+            if item["type"] == "section"
+        ]
+        current_section = 0
+        for idx, section_idx in enumerate(section_starts):
+            if section_idx < current:
+                current_section = idx
+        next_section = max(0, min(len(section_starts) - 1, current_section + direction))
+        start = section_starts[next_section]
+        candidates = [idx for idx in selectable if idx > start]
+        if candidates:
+            self.tools_selected_index = candidates[0]
+        self.render_tools()
+        self.update_status()
+
+    def run_selected_tool(self):
+        items = self.tools_items()
+        if self.tools_selected_index < 0 or self.tools_selected_index >= len(items):
+            return "break"
+        item = items[self.tools_selected_index]
+        if item.get("type") != "action" or not item.get("enabled", True):
+            self.update_status("tool is planned, not wired yet")
+            return "break"
+        action = item.get("id")
+        if action == "update_return_tab":
+            view = self.tools_return_view if self.tools_return_view in (*self.grid_views, "nowplaying", "info") else "queue"
+            self.close_tools_tab()
+            self.select_view_tab(view)
+            return self.refresh_from_key()
+        if action == "hydrate_return_tab":
+            view = self.tools_return_view if self.tools_return_view in self.grid_views else "queue"
+            self.close_tools_tab()
+            self.select_view_tab(view)
+            return self.confirm_hydrate_covers()
+        if action == "rebuild_library":
+            self.close_tools_tab()
+            self.select_view_tab("library")
+            self.start_library_load(rebuild=True)
+            return "break"
+        if action == "refresh_phone":
+            if not self.phone_enabled:
+                self.update_status("phone is not enabled")
+                return "break"
+            self.close_tools_tab()
+            self.select_view_tab("phone")
+            self.start_phone_load()
+            return "break"
+        if action == "open_hydrate_log":
+            self.show_hydrate_tab()
+            self.start_hydrate_tail()
+            return "break"
+        self.update_status(f"unknown tool: {action}")
+        return "break"
+
     def confirm_hydrate_covers(self):
         if self.active_view == "help":
             return "break"
@@ -1767,14 +2184,31 @@ json.dump(out, sys.stdout)
             self.show_hydrate_tab()
             self.update_status("hydrate already running")
             return "break"
+        return self.prompt_hydrate_active_view()
+
+    def maybe_offer_hydrate_after_refresh(self, view):
+        if self.refresh_hydrate_after_load != view:
+            return "break"
+        self.refresh_hydrate_after_load = None
+        if self.active_view != view:
+            return "break"
+        if self.hydrate_process is not None and self.hydrate_process.poll() is None:
+            self.update_status(f"{view} refreshed; hydrate already running")
+            return "break"
+        return self.prompt_hydrate_active_view(
+            prompt_prefix=f"{view.capitalize()} refreshed. "
+        )
+
+    def prompt_hydrate_active_view(self, prompt_prefix=""):
         records_path, missing_count = self.write_active_missing_hydrate_records()
         if missing_count <= 0:
             self.update_status(f"{self.active_view}: no missing covers to hydrate")
             return "break"
         view_label = self.active_view.capitalize()
+        hydrate_count = missing_count if missing_count <= 100 else f"up to 100 of {missing_count}"
         ok = messagebox.askyesno(
             "Hydrate covers",
-            f"Hydrate {missing_count} missing {view_label} cover{'s' if missing_count != 1 else ''} now?\n\n"
+            f"{prompt_prefix}Hydrate {hydrate_count} missing {view_label} cover{'s' if missing_count != 1 else ''} now?\n\n"
             "Progress will open in the Hydrate tab.",
             parent=self.root,
         )
@@ -2065,24 +2499,31 @@ json.dump(out, sys.stdout)
                 "  o          jump selection to currently playing album",
                 "  s          save current playlist",
                 "  S          save current playlist as",
+                "  r          refresh queue and offer missing cover hydrate",
                 "",
                 "Library",
                 "  /          search artist or album",
                 "  n / N      next / previous search match",
                 "  m          mark selected album for phone send",
-                "  u          hydrate missing covers in current view",
                 "  Enter      insert selected album after current album and play it",
                 "  a          insert selected album after current album",
                 "  A          append selected album to end of playlist",
                 "  i          open selected album info",
                 "  o          jump selection to currently playing album",
-                "  r          rebuild/refresh library",
+                "  r          rebuild library and offer missing cover hydrate",
                 "",
                 "Phone",
                 "  m          mark selected album for phone delete",
                 "  d          delete selected album from phone",
                 "  i          open selected album info",
-                "  r          refresh phone albums",
+                "  r          refresh phone albums and offer missing cover hydrate",
+                "",
+                "Tools",
+                "  :tools     open Tools",
+                "  j / k      move between actions",
+                "  J / K      jump between sections",
+                "  Enter      run selected action",
+                "  q          close Tools",
                 "",
                 "Info",
                 "  j / k      move track highlight",
@@ -2101,6 +2542,7 @@ json.dump(out, sys.stdout)
                 "  p          send selected album to phone and show Transfers",
                 "  c          cancel active transfer from Transfers",
                 "  t          add current song to sick_tunes",
+                "  :          command prompt; try tools, refresh, hydrate, sick-tunes",
                 "  f          toggle fullscreen",
                 "  Esc        exit fullscreen",
                 "  ?          show this help",
@@ -2144,6 +2586,9 @@ json.dump(out, sys.stdout)
         self.update_selection()
 
     def move_vertical(self, direction):
+        if self.active_view == "tools":
+            self.move_tools_selection(direction)
+            return
         if self.active_view in ("nowplaying", "info"):
             if self.text_pane_focus.get(self.active_view) == "bio":
                 self.bio_text.yview_scroll(direction * 3, "units")
@@ -2161,6 +2606,9 @@ json.dump(out, sys.stdout)
         return "break"
 
     def move_pane_or_page(self, direction):
+        if self.active_view == "tools":
+            self.move_tools_section(direction)
+            return
         if self.active_view in ("nowplaying", "info"):
             self.set_text_pane_focus("bio" if direction > 0 else "tracks")
             return
@@ -2731,6 +3179,8 @@ json.dump(out, sys.stdout)
     def on_select(self):
         if self.active_view == "help":
             return "break"
+        if self.active_view == "tools":
+            return self.run_selected_tool()
         if self.active_view == "nowplaying":
             self.play_selected_nowplaying_track()
             return "break"
@@ -3056,6 +3506,8 @@ json.dump(out, sys.stdout)
             return
         prepared = result.get("prepared") or {}
         copied = result.get("copied") or {}
+        if copied.get("name"):
+            self.remember_phone_index_item(item, copied)
         if copied.get("already_exists"):
             message = "it's already on the phone, man"
             self.complete_phone_transfer_log(message, self.phone_transfer_item_title(item))
@@ -3090,6 +3542,8 @@ json.dump(out, sys.stdout)
         for sent in sent_items:
             item = sent.get("item") or {}
             copied = sent.get("copied") or {}
+            if copied.get("name"):
+                self.remember_phone_index_item(item, copied)
             if copied.get("already_exists"):
                 self.append_transfer_line(f"it's already on the phone, man: {self.phone_transfer_item_title(item)}")
             else:
@@ -3458,6 +3912,7 @@ json.dump(out, sys.stdout)
         rel_dir = result.get("rel_dir") or deleted.get("rel_dir")
         if rel_dir:
             self.marked_grid_items.setdefault("phone", set()).discard(rel_dir)
+            self.forget_phone_index_items([rel_dir])
         playlist = result.get("playlist") or {}
         playlist_error = result.get("playlist_error")
         if playlist:
@@ -3484,6 +3939,9 @@ json.dump(out, sys.stdout)
             key = deleted.get("rel_dir")
             if key:
                 self.marked_grid_items.setdefault("phone", set()).discard(key)
+        self.forget_phone_index_items(deleted.get("rel_dir") for deleted in deleted_items)
+        for deleted in deleted_items:
+            key = deleted.get("rel_dir")
             name = (deleted.get("deleted") or {}).get("name") or deleted.get("name") or key
             self.append_transfer_line(f"deleted from phone: {name}")
         for error in errors:

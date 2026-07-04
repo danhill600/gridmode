@@ -183,7 +183,9 @@ is written to `hydrate.log` in the configured cache directory by default; use
 - `a`: add selected library album after the currently playing album.
 - `A`: append selected library album to the end of the playlist.
 - `d`: remove selected Queue album occurrence from the current MPD playlist.
-- `r`: refresh/rebuild the active view.
+- `r`: refresh the active tab; offers targeted missing-cover hydration.
+- `t`: add the current song to `sick_tunes`.
+- `:`: command prompt; try `tools`, `refresh`, `hydrate`, or `sick-tunes`.
 - `?`: open/close Help.
 - `f`: toggle fullscreen.
 - `q`: close transient tab or quit.
