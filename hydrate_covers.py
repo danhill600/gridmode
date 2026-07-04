@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("config", nargs="?", default=DEFAULT_CONFIG)
     parser.add_argument("--playlist", action="store_true", help="hydrate only the current MPD playlist")
     parser.add_argument("--library-index", action="store_true", help="hydrate from cache/library_index.json instead of scanning MPD")
+    parser.add_argument("--records-file", default=None, help="hydrate album records from a Gridmode JSON records file")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many missing covers are attempted")
     parser.add_argument("--music-root", default=None, help="music root matching MPD file paths")
     parser.add_argument("--ssh-host", default=None, help="SSH host for reading remote local art; empty disables SSH")
@@ -101,6 +102,51 @@ def load_library_index_records(cache_dir):
     return records
 
 
+def load_records_file(path):
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    if isinstance(data, dict):
+        raw_records = data.get("albums", [])
+    elif isinstance(data, list):
+        raw_records = data
+    else:
+        raw_records = []
+    if not isinstance(raw_records, list):
+        return []
+
+    records = []
+    seen = set()
+    for item in raw_records:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        if not isinstance(key, list):
+            continue
+        artist = str(item.get("artist", "")).strip()
+        album = str(item.get("album", "")).strip()
+        if not artist or not album:
+            continue
+        record_key = tuple(str(part) for part in key)
+        if record_key in seen:
+            continue
+        seen.add(record_key)
+        records.append(
+            AlbumRecord(
+                artist=artist,
+                album=album,
+                key=record_key,
+                rel_dir=str(item.get("rel_dir", "")),
+            )
+        )
+    return records
+
+
 def main():
     args = parse_args()
     cfg = config_to_mapping(load_app_config(args.config))
@@ -123,7 +169,10 @@ def main():
     log.write(f"hydrate started: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     if log_path:
         log.write(f"log: {log_path}")
-    if args.library_index:
+    if args.records_file:
+        log.write(f"loading album records from {args.records_file}")
+        records = load_records_file(expand_path(args.records_file))
+    elif args.library_index:
         log.write("loading album records from cached library index")
         records = load_library_index_records(cache_dir)
         if not records:

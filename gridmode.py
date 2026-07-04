@@ -270,6 +270,7 @@ class GridModeApp:
         self.info_return_view = "queue"
         self.hydrate_tab_visible = False
         self.hydrate_return_view = "library"
+        self.hydrate_target_view = "library"
         self.hydrate_process = None
         self.hydrate_tail_after_id = None
         self.hydrate_log_path = os.path.join(self.cache_dir, "hydrate.log")
@@ -1766,21 +1767,83 @@ json.dump(out, sys.stdout)
             self.show_hydrate_tab()
             self.update_status("hydrate already running")
             return "break"
+        records_path, missing_count = self.write_active_missing_hydrate_records()
+        if missing_count <= 0:
+            self.update_status(f"{self.active_view}: no missing covers to hydrate")
+            return "break"
+        view_label = self.active_view.capitalize()
         ok = messagebox.askyesno(
             "Hydrate covers",
-            "Hydrate up to 100 missing covers now?\n\nProgress will open in the Hydrate tab.",
+            f"Hydrate {missing_count} missing {view_label} cover{'s' if missing_count != 1 else ''} now?\n\n"
+            "Progress will open in the Hydrate tab.",
             parent=self.root,
         )
         if not ok:
             self.update_status("hydrate cancelled")
             return "break"
-        return self.start_hydrate_covers()
+        return self.start_hydrate_covers(records_path=records_path, retry_failures=True)
 
-    def start_hydrate_covers(self):
+    def write_active_missing_hydrate_records(self):
+        if self.active_view not in self.grid_views:
+            return "", 0
+        items = self.active_items()
+        albums = [(item["artist"], item["album"]) for item in items]
+        album_keys = [item["key"] for item in items]
+        cover_paths, _, _ = self.cover_paths_for(albums, album_keys)
+        records = []
+        seen = set()
+        for item, cover_path in zip(items, cover_paths):
+            if cover_path:
+                continue
+            artist = str(item.get("artist", "")).strip()
+            album = str(item.get("album", "")).strip()
+            key = item.get("key")
+            if not artist or not album or key is None:
+                continue
+            record_key = tuple(str(part) for part in key)
+            if record_key in seen:
+                continue
+            seen.add(record_key)
+            records.append(
+                {
+                    "artist": artist,
+                    "album": album,
+                    "key": list(record_key),
+                    "rel_dir": item.get("rel_dir", ""),
+                }
+            )
+
+        path = os.path.join(self.cache_dir, "hydrate_targets.json")
+        payload = {
+            "version": 1,
+            "generated_at": time.time(),
+            "view": self.active_view,
+            "albums": records,
+        }
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except OSError:
+            logging.exception("Failed to save hydrate targets")
+            return "", 0
+        return path, len(records)
+
+    def start_hydrate_covers(self, records_path="", retry_failures=False):
         self.show_hydrate_tab()
+        self.hydrate_target_view = self.hydrate_return_view
         self.set_hydrate_text("")
         self.hydrate_log_position = self.hydrate_log_size()
-        cmd = [sys.executable, "hydrate_covers.py", "--library-index", "--limit", "100"]
+        cmd = [sys.executable, "hydrate_covers.py"]
+        if records_path:
+            cmd.extend(["--records-file", records_path])
+        else:
+            cmd.append("--library-index")
+        if retry_failures:
+            cmd.append("--retry-failures")
+        cmd.extend(["--limit", "100"])
         try:
             self.hydrate_process = subprocess.Popen(
                 cmd,
@@ -1843,8 +1906,9 @@ json.dump(out, sys.stdout)
             code = self.hydrate_process.returncode
             self.append_hydrate_text(f"hydrate exited: {code}\n")
             self.hydrate_process = None
-            self.view_grid_cache.pop("library", None)
-            if self.active_view == "library":
+            target_view = self.hydrate_target_view if self.hydrate_target_view in self.grid_views else "library"
+            self.view_grid_cache.pop(target_view, None)
+            if self.active_view == target_view:
                 self.prepare_active_grid(use_cache=False)
                 self.reset_images()
                 self.render_grid()
@@ -2006,7 +2070,7 @@ json.dump(out, sys.stdout)
                 "  /          search artist or album",
                 "  n / N      next / previous search match",
                 "  m          mark selected album for phone send",
-                "  u          hydrate up to 100 missing covers",
+                "  u          hydrate missing covers in current view",
                 "  Enter      insert selected album after current album and play it",
                 "  a          insert selected album after current album",
                 "  A          append selected album to end of playlist",
