@@ -37,6 +37,8 @@ Current direction:
 - Tools is a transient tab for maintenance. Navigate with `j/k`, jump sections
   with `J/K`, and run with Enter. Planned/destructive/global actions should be
   listed there before receiving top-level bindings.
+- Grid navigation keys should win in grid tabs when they are broadly useful.
+  `0` and `e` are row-start/row-end.
 
 Cover workflow split:
 

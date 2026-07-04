@@ -177,6 +177,7 @@ is written to `hydrate.log` in the configured cache directory by default; use
 - `p`: send selected Queue, Library, Now Playing, or Info album to the phone.
 - `h`, `j`, `k`, `l`: move around cover grids.
 - `J`, `K`: page movement in grids; track/bio focus in detail views.
+- `0`, `e`: jump to the first or last item in the current grid row.
 - `Enter`: play/select current item.
 - `o`: jump to the currently playing album or track.
 - `i`: open/close an album Info tab.

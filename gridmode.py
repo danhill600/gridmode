@@ -530,6 +530,8 @@ class GridModeApp:
         self.root.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.root.bind("r", lambda e: self.refresh_from_key())
         self.root.bind_all("q", self.global_key(lambda e: self.close_info_or_quit()))
+        self.root.bind_all("0", self.global_key(lambda e: self.jump_grid_row_edge("start")))
+        self.root.bind_all("e", self.global_key(lambda e: self.jump_grid_row_edge("end")))
         self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         self.root.bind("<Configure>", self.on_root_configure)
 
@@ -1984,6 +1986,8 @@ json.dump(out, sys.stdout)
             "follow-mode": "follow",
             "fs": "fullscreen",
             "full-screen": "fullscreen",
+            "append-album": "append",
+            "append-selected": "append",
             "sick": "sick-tunes",
             "sick-tune": "sick-tunes",
             "sicktunes": "sick-tunes",
@@ -2003,6 +2007,8 @@ json.dump(out, sys.stdout)
             return "break"
         if name == "sick-tunes":
             return self.append_current_song_to_sick_tunes()
+        if name == "append":
+            return self.append_selected_library_album()
         if not name:
             self.update_status("empty command")
         else:
@@ -2410,6 +2416,25 @@ json.dump(out, sys.stdout)
         self.render_visible()
         return "break"
 
+    def jump_grid_row_edge(self, edge):
+        self.pending_leader = None
+        if self.active_view not in self.grid_views or not self.albums:
+            return "break"
+        cols = max(self.columns, 1)
+        row_start = (self.selected_index // cols) * cols
+        if edge == "start":
+            idx = row_start
+        elif edge == "end":
+            idx = min(row_start + cols - 1, len(self.albums) - 1)
+        else:
+            return "break"
+        self.view_selected_indices[self.active_view] = idx
+        self.selected_index = idx
+        self.last_selected_index = None
+        self.ensure_visible(idx)
+        self.render_visible()
+        return "break"
+
     def begin_library_search(self):
         if self.active_view != "library":
             return "break"
@@ -2509,6 +2534,8 @@ json.dump(out, sys.stdout)
                 "  K          page up",
                 "  PageDown   page down",
                 "  PageUp     page up",
+                "  0          first item in current row",
+                "  e          last item in current row",
                 "  z          jump to random album",
                 "  gg         jump to top",
                 "  G          jump to bottom",
