@@ -146,6 +146,13 @@ library index and then uses Gridmode's local cover cache. Exact folder matches
 win, with a fallback that tolerates common suffix differences like years,
 labels, `[WEB FLAC]`, and other format markers.
 
+## Android Lifeboat Client
+
+An adjunct Android client lives in `android/`. Its MVP reads a user-selected
+lifeboat directory on the phone, shows direct child album folders as a cover
+grid, and starts local album playback on tap. See `android/README.md` for the
+phone-side layout and build notes.
+
 ## Cover Hydration
 
 Hydrate missing album covers:

@@ -5,3 +5,8 @@ gridmode.desktop
 __pycache__/
 .*.swp
 notes/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/app/build/
+android/build/
