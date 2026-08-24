@@ -46,6 +46,8 @@ Cover workflow split:
 - Normal update path: targeted, current-view, user-facing. This is for "I added
   albums; show me covers now." It should not be blocked by the global
   `failures.json` backlog.
+- Initial hydration: library-wide, long-running, and suitable for Tools/Settings.
+  It should use the Hydrate tab/log surface, not a top-level shortcut.
 - Deep cover repair: global, slow, failure-aware, maintenance-oriented. This is
   for retrying old exotic/tough missing covers and should live in Tools/CLI, not
   in the normal refresh path.

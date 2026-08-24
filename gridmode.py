@@ -2031,6 +2031,12 @@ json.dump(out, sys.stdout)
                 "detail": "Run the targeted cover hydrate without first refreshing the tab.",
             },
             {
+                "type": "action",
+                "id": "hydrate_full_library",
+                "label": "Hydrate full library",
+                "detail": "Run the initial or catch-up cover hydrate across the cached library index.",
+            },
+            {
                 "type": "disabled",
                 "label": "Deep cover repair: retry known failures",
                 "detail": "Planned maintenance flow; global, slower, failure-aware.",
@@ -2188,6 +2194,8 @@ json.dump(out, sys.stdout)
             self.close_tools_tab()
             self.select_view_tab(view)
             return self.confirm_hydrate_covers()
+        if action == "hydrate_full_library":
+            return self.confirm_hydrate_full_library()
         if action == "rebuild_library":
             self.close_tools_tab()
             self.select_view_tab("library")
@@ -2216,6 +2224,24 @@ json.dump(out, sys.stdout)
             self.update_status("hydrate already running")
             return "break"
         return self.prompt_hydrate_active_view()
+
+    def confirm_hydrate_full_library(self):
+        if self.hydrate_process is not None and self.hydrate_process.poll() is None:
+            self.show_hydrate_tab()
+            self.update_status("hydrate already running")
+            return "break"
+        ok = messagebox.askyesno(
+            "Hydrate full library",
+            "Hydrate missing covers across the full library now?\n\n"
+            "This can run for a long time on a large collection. Progress will open in the Hydrate tab.",
+            parent=self.root,
+        )
+        if not ok:
+            self.update_status("hydrate cancelled")
+            return "break"
+        self.close_tools_tab()
+        self.hydrate_target_view = "library"
+        return self.start_hydrate_covers(limit=None, target_view="library")
 
     def maybe_offer_hydrate_after_refresh(self, view):
         if self.refresh_hydrate_after_load != view:
@@ -2296,9 +2322,9 @@ json.dump(out, sys.stdout)
             return "", 0
         return path, len(records)
 
-    def start_hydrate_covers(self, records_path="", retry_failures=False):
+    def start_hydrate_covers(self, records_path="", retry_failures=False, limit=100, target_view=None):
         self.show_hydrate_tab()
-        self.hydrate_target_view = self.hydrate_return_view
+        self.hydrate_target_view = target_view or self.hydrate_return_view
         self.set_hydrate_text("")
         self.hydrate_log_position = self.hydrate_log_size()
         cmd = [sys.executable, "hydrate_covers.py"]
@@ -2308,7 +2334,8 @@ json.dump(out, sys.stdout)
             cmd.append("--library-index")
         if retry_failures:
             cmd.append("--retry-failures")
-        cmd.extend(["--limit", "100"])
+        if limit is not None:
+            cmd.extend(["--limit", str(limit)])
         try:
             self.hydrate_process = subprocess.Popen(
                 cmd,

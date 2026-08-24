@@ -162,6 +162,10 @@ Hydrate missing album covers:
 .venv/bin/python hydrate_covers.py
 ```
 
+You can also start hydration inside Gridmode with `:tools` or `:settings`.
+Choose `Hydrate full library` for an initial library-wide run, or use the
+targeted hydrate action for the tab you were viewing.
+
 Useful options:
 
 ```sh
