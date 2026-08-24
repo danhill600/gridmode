@@ -20,6 +20,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(mapping["mpd"]["host"], "localhost")
         self.assertEqual(mapping["music"]["root"], "")
         self.assertEqual(mapping["music"]["ssh_host"], "")
+        self.assertEqual(mapping["playlists"]["favorite_tracks"], "favorite_tracks")
+        self.assertEqual(mapping["playlists"]["phone_recent"], "phone-recent.m3u")
         self.assertEqual(mapping["ui"]["nowplaying_cover_size"], 420)
 
     def test_requires_public_runtime_fields(self):

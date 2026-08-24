@@ -32,8 +32,14 @@ transcode_missing_lossy = false
 # an ssh_host alias that points at port 8022.
 enabled = false
 ssh_host = ""
-# Example Android/Termux target: "/storage/emulated/0/Android/media/lifeboat"
+# Example Android/Termux target: "/storage/emulated/0/Music/Gridmode"
 music_root = ""
+
+[playlists]
+# MPD playlist used by the "t" key for the current track.
+favorite_tracks = "favorite_tracks"
+# M3U generated for the phone library when phone support is enabled.
+phone_recent = "phone-recent.m3u"
 
 [ui]
 columns = 5

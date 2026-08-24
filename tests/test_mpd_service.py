@@ -129,10 +129,10 @@ class QueueOccurrenceTests(unittest.TestCase):
     def test_append_current_song_to_playlist_uses_single_file(self):
         client = FakeClient([song(0, "Artist", "Album", "a/01.flac")])
 
-        result = append_current_song_to_playlist(client, "sick_tunes")
+        result = append_current_song_to_playlist(client, "favorite_tracks")
 
-        self.assertEqual(result, {"ok": True, "playlist": "sick_tunes", "file": "a/01.flac"})
-        self.assertEqual(client.playlist_added, [("sick_tunes", "a/01.flac")])
+        self.assertEqual(result, {"ok": True, "playlist": "favorite_tracks", "file": "a/01.flac"})
+        self.assertEqual(client.playlist_added, [("favorite_tracks", "a/01.flac")])
 
 
 if __name__ == "__main__":

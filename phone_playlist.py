@@ -10,7 +10,7 @@ from phone_service import list_phone_album_dirs, list_phone_album_tracks, lossy_
 
 
 DEFAULT_CONFIG = "config.toml"
-DEFAULT_PLAYLIST_NAME = "lifeboat-recent.m3u"
+DEFAULT_PLAYLIST_NAME = "phone-recent.m3u"
 
 
 def library_index_path(cache_dir):
@@ -150,9 +150,11 @@ cat > "$root/$name"
         raise RuntimeError(proc.stderr.strip() or f"ssh exited {proc.returncode}")
 
 
-def generate_playlist_from_config(cfg, playlist_name=DEFAULT_PLAYLIST_NAME, local_output="", copy_to_phone=True):
+def generate_playlist_from_config(cfg, playlist_name="", local_output="", copy_to_phone=True):
     music_cfg = cfg.get("music", {})
     phone_cfg = cfg.get("phone", {})
+    playlist_cfg = cfg.get("playlists", {})
+    playlist_name = playlist_name or playlist_cfg.get("phone_recent") or DEFAULT_PLAYLIST_NAME
     cache_dir = cfg.get("cache", {}).get("dir", "")
     library_items = load_library_index(cache_dir)
     phone_albums = list_phone_album_dirs(
@@ -199,7 +201,7 @@ def generate_playlist(config_path=DEFAULT_CONFIG, playlist_name=DEFAULT_PLAYLIST
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Generate a lifeboat M3U sorted by oldbeast library mtime.")
+    parser = argparse.ArgumentParser(description="Generate a phone M3U sorted by Gridmode library mtime.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--name", default=DEFAULT_PLAYLIST_NAME)
     parser.add_argument("--local-output", default="")

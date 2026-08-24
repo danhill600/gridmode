@@ -1,13 +1,13 @@
 # Gridmode Lifeboat Android
 
-This is an adjunct Android client for the phone-side `lifeboat` music directory.
+This is an adjunct Android client for a phone-side music directory.
 The MVP scans a user-selected folder, treats each direct child directory as an
 album, displays album covers in a grid, and starts album playback on tap.
 
 Expected phone layout:
 
 ```text
-lifeboat/
+Music/
   Artist - Album/
     cover.png
     01 Track.mp3
@@ -30,5 +30,5 @@ install that is compatible with Android Gradle Plugin 9.2:
 gradle :app:assembleDebug
 ```
 
-On first launch, pick the phone's lifeboat directory with the system folder
-picker. The app persists read access to that tree.
+On first launch, pick the phone's music directory with the system folder picker.
+The app persists read access to that tree.

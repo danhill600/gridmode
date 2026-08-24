@@ -503,7 +503,7 @@ class GridModeApp:
         self.root.bind_all("z", self.global_key(lambda e: self.jump_grid_position("random")))
         self.root.bind_all("s", self.global_key(lambda e: self.save_current_playlist()))
         self.root.bind_all("S", self.global_key(lambda e: self.save_current_playlist_as()))
-        self.root.bind_all("t", self.global_key(lambda e: self.append_current_song_to_sick_tunes()))
+        self.root.bind_all("t", self.global_key(lambda e: self.append_current_song_to_favorites()))
         self.root.bind_all(":", self.global_key(lambda e: self.command_prompt()))
         self.root.bind_all("c", self.global_key(lambda e: self.cancel_phone_transfer_from_key()))
         self.root.bind_all("m", self.global_key(lambda e: self.toggle_phone_mark()))
@@ -1332,15 +1332,15 @@ json.dump(out, sys.stdout)
 
     def start_library_load(self, rebuild=False):
         if "library" in self.loading_views:
-            self.render_loading("hold up loading your library doggie")
+            self.render_loading("loading library")
             return
         self.loading_views.add("library")
         self.view_grid_cache.pop("library", None)
         self.view_loaded["library"] = False
         self.begin_loading_screen()
         self.root.update_idletasks()
-        self.render_loading("hold up loading your library doggie")
-        self.start_loading_animation("hold up loading your library doggie")
+        self.render_loading("loading library")
+        self.start_loading_animation("loading library")
         self.root.update_idletasks()
         self.root.after(80, self.start_library_load_worker, rebuild)
 
@@ -1384,15 +1384,15 @@ json.dump(out, sys.stdout)
 
     def start_phone_load(self):
         if "phone" in self.loading_views:
-            self.render_loading("ur phobe is lobing sweetpal")
+            self.render_loading("loading phone library")
             return
         self.loading_views.add("phone")
         self.view_grid_cache.pop("phone", None)
         self.view_loaded["phone"] = False
         self.begin_loading_screen()
         self.root.update_idletasks()
-        self.render_loading("ur phobe is lobing sweetpal")
-        self.start_loading_animation("ur phobe is lobing sweetpal")
+        self.render_loading("loading phone library")
+        self.start_loading_animation("loading phone library")
         self.root.update_idletasks()
         self.root.after(80, self.start_phone_load_worker)
 
@@ -2006,7 +2006,7 @@ json.dump(out, sys.stdout)
             self.toggle_fullscreen()
             return "break"
         if name == "sick-tunes":
-            return self.append_current_song_to_sick_tunes()
+            return self.append_current_song_to_favorites()
         if name == "append":
             return self.append_selected_library_album()
         if not name:
@@ -2593,7 +2593,7 @@ json.dump(out, sys.stdout)
                 "  H / L      move to previous / next tab",
                 "  p          send selected album to phone and show Transfers",
                 "  c          cancel active transfer from Transfers",
-                "  t          add current song to sick_tunes",
+                "  t          add current song to configured favorites playlist",
                 "  f          toggle follow mode",
                 "  :          command prompt; try tools, refresh, hydrate, follow, fullscreen, sick-tunes",
                 "  Esc        exit fullscreen",
@@ -3550,10 +3550,11 @@ json.dump(out, sys.stdout)
 
     def update_phone_playlist_for_worker(self, progress):
         progress("Updating phone playlist...")
+        playlist_name = self.cfg.get("playlists", {}).get("phone_recent", DEFAULT_PLAYLIST_NAME)
         result = generate_playlist_from_config(
             self.cfg,
-            playlist_name=DEFAULT_PLAYLIST_NAME,
-            local_output=os.path.join(self.cache_dir, DEFAULT_PLAYLIST_NAME),
+            playlist_name=playlist_name,
+            local_output=os.path.join(self.cache_dir, playlist_name),
             copy_to_phone=True,
         )
         progress(f"Updated {result['playlist']}: {result['tracks']} tracks")
@@ -3739,11 +3740,11 @@ json.dump(out, sys.stdout)
         else:
             self.update_status(f"playlist save error: {result.get('error', 'unknown')}")
 
-    def append_current_song_to_sick_tunes(self):
+    def append_current_song_to_favorites(self):
         mpd_host = require_cfg(self.cfg, "mpd", "host")
         mpd_port = require_cfg(self.cfg, "mpd", "port")
         mpd_password = self.cfg.get("mpd", {}).get("password", "")
-        playlist_name = "sick_tunes"
+        playlist_name = self.cfg.get("playlists", {}).get("favorite_tracks", "favorite_tracks")
         try:
             client = connect_mpd(mpd_host, mpd_port, mpd_password, timeout=30)
             try:
@@ -3755,8 +3756,8 @@ json.dump(out, sys.stdout)
                 except Exception:
                     pass
         except Exception as e:
-            logging.exception("Failed to append current song to sick_tunes")
-            self.update_status(f"sick_tunes error: {e}")
+            logging.exception("Failed to append current song to favorites playlist")
+            self.update_status(f"{playlist_name} error: {e}")
             return "break"
         if result.get("ok"):
             self.update_status(f"added current song to {playlist_name}")

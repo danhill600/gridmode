@@ -13,7 +13,8 @@ upscale only when no better source exists.
 ## Interaction model: daily keys vs Tools
 
 Top-level keys should be reserved for frequent browsing/listening actions.
-`t` is intentionally global for adding the current song to `sick_tunes`; that is
+`t` is intentionally global for adding the current song to the configured
+favorite-tracks playlist; that is
 a clutch listening action and should work everywhere.
 
 Maintenance, diagnostics, slow global repair jobs, and rarely used operations

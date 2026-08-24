@@ -38,6 +38,12 @@ class PhoneConfig:
 
 
 @dataclass(frozen=True)
+class PlaylistsConfig:
+    favorite_tracks: str = "favorite_tracks"
+    phone_recent: str = "phone-recent.m3u"
+
+
+@dataclass(frozen=True)
 class UiConfig:
     columns: int
     cell_size: int
@@ -63,6 +69,7 @@ class AppConfig:
     cache: CacheConfig
     music: MusicConfig
     phone: PhoneConfig
+    playlists: PlaylistsConfig
     ui: UiConfig
 
 
@@ -77,6 +84,7 @@ def parse_app_config(raw):
     lastfm = raw.get("lastfm", {})
     music = raw.get("music", {})
     phone = raw.get("phone", {})
+    playlists = raw.get("playlists", {})
 
     errors = []
     host = _string(mpd.get("host"))
@@ -115,6 +123,10 @@ def parse_app_config(raw):
             enabled=_bool(phone.get("enabled"), False),
             ssh_host=_string(phone.get("ssh_host")),
             music_root=_string(phone.get("music_root")),
+        ),
+        playlists=PlaylistsConfig(
+            favorite_tracks=_string(playlists.get("favorite_tracks"), "favorite_tracks"),
+            phone_recent=_string(playlists.get("phone_recent"), "phone-recent.m3u"),
         ),
         ui=UiConfig(
             columns=columns,
@@ -161,6 +173,10 @@ def config_to_mapping(config):
             "enabled": config.phone.enabled,
             "ssh_host": config.phone.ssh_host,
             "music_root": config.phone.music_root,
+        },
+        "playlists": {
+            "favorite_tracks": config.playlists.favorite_tracks,
+            "phone_recent": config.playlists.phone_recent,
         },
         "ui": {
             "columns": config.ui.columns,

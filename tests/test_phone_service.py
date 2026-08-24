@@ -69,7 +69,7 @@ class DeletePhoneAlbumTests(unittest.TestCase):
             stderr="",
         )
         with mock.patch("phone_service._run_cancelable", return_value=completed) as run:
-            result = delete_phone_album_dir("oldbeast", "phone", "/music", rel_dir)
+            result = delete_phone_album_dir("music-host", "phone", "/music", rel_dir)
 
         self.assertTrue(result["deleted"])
         cmd = run.call_args.args[0]
@@ -80,19 +80,19 @@ class DeletePhoneAlbumTests(unittest.TestCase):
 
     def test_delete_phone_album_requires_rel_dir(self):
         with self.assertRaises(ValueError):
-            delete_phone_album_dir("oldbeast", "phone", "/music", "")
+            delete_phone_album_dir("music-host", "phone", "/music", "")
 
 
 class PhoneAlbumExistsTests(unittest.TestCase):
     def test_phone_album_dir_exists_true_on_zero(self):
         completed = subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
         with mock.patch("phone_service._run_cancelable", return_value=completed):
-            self.assertTrue(phone_album_dir_exists("oldbeast", "phone", "/music", "Album"))
+            self.assertTrue(phone_album_dir_exists("music-host", "phone", "/music", "Album"))
 
     def test_phone_album_dir_exists_false_on_one(self):
         completed = subprocess.CompletedProcess(["ssh"], 1, stdout="", stderr="")
         with mock.patch("phone_service._run_cancelable", return_value=completed):
-            self.assertFalse(phone_album_dir_exists("oldbeast", "phone", "/music", "Album"))
+            self.assertFalse(phone_album_dir_exists("music-host", "phone", "/music", "Album"))
 
 
 class PhoneAlbumTracksTests(unittest.TestCase):
@@ -104,7 +104,7 @@ class PhoneAlbumTracksTests(unittest.TestCase):
             stderr="",
         )
         with mock.patch("subprocess.run", return_value=completed) as run:
-            tracks = list_phone_album_tracks("oldbeast", "phone", "/music", ["Album; nope"])
+            tracks = list_phone_album_tracks("music-host", "phone", "/music", ["Album; nope"])
 
         self.assertEqual(tracks, {"Album; nope": ["Album; nope/01 Song.mp3"]})
         cmd = run.call_args.args[0]

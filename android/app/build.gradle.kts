@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.oldbeast.gridmode.lifeboat"
+    namespace = "org.gridmode.lifeboat"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.oldbeast.gridmode.lifeboat"
+        applicationId = "org.gridmode.lifeboat"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

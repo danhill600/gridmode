@@ -86,6 +86,7 @@ Optional sections:
 - `music`: local or SSH-accessible music root used for local cover discovery and
   library directory mtimes. Leave these empty if Gridmode should rely only on MPD
   metadata and remote web cover lookup.
+- `playlists`: local playlist names for favorite tracks and generated phone M3Us.
 
 If `music.ssh_host` is set, it should be an SSH host alias or hostname that can
 read `music.root`.
@@ -101,7 +102,7 @@ specific but useful setup:
 - A lossy mirror may live beside that library.
 - The phone runs an SSH server, for example Termux `sshd`.
 - The phone exposes a writable music directory such as
-  `/storage/emulated/0/Android/media/lifeboat`.
+  `/storage/emulated/0/Music/Gridmode`.
 
 The relevant config shape is:
 
@@ -116,7 +117,7 @@ transcode_missing_lossy = false
 [phone]
 enabled = true
 ssh_host = "phone"
-music_root = "/storage/emulated/0/Android/media/lifeboat"
+music_root = "/storage/emulated/0/Music/Gridmode"
 ```
 
 `music.ssh_host` and `phone.ssh_host` are SSH aliases or hostnames. They are
@@ -149,9 +150,9 @@ labels, `[WEB FLAC]`, and other format markers.
 ## Android Lifeboat Client
 
 An adjunct Android client lives in `android/`. Its MVP reads a user-selected
-lifeboat directory on the phone, shows direct child album folders as a cover
-grid, and starts local album playback on tap. See `android/README.md` for the
-phone-side layout and build notes.
+phone music directory, shows direct child album folders as a cover grid, and
+starts local album playback on tap. See `android/README.md` for the phone-side
+layout and build notes.
 
 ## Cover Hydration
 
@@ -192,7 +193,7 @@ is written to `hydrate.log` in the configured cache directory by default; use
 - `A`: append selected library album to the end of the playlist.
 - `d`: remove selected Queue album occurrence from the current MPD playlist.
 - `r`: refresh the active tab; offers targeted missing-cover hydration.
-- `t`: add the current song to `sick_tunes`.
+- `t`: add the current song to the configured favorite-tracks playlist.
 - `f`: toggle follow mode, which keeps Queue/Library/Now Playing focused on playback.
 - `:`: command prompt; try `tools`, `refresh`, `hydrate`, `follow`, `fullscreen`, or `sick-tunes`.
 - `?`: open/close Help.

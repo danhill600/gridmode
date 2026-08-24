@@ -51,8 +51,9 @@ class PhonePlaylistTests(unittest.TestCase):
     def test_generate_playlist_from_config_writes_phone_copy(self):
         cfg = {
             "cache": {"dir": "/cache"},
-            "music": {"ssh_host": "oldbeast"},
+            "music": {"ssh_host": "music-host"},
             "phone": {"ssh_host": "phone", "music_root": "/music"},
+            "playlists": {"phone_recent": "recent.m3u"},
         }
         with (
             mock.patch("phone_playlist.load_library_index", return_value=[{
@@ -69,9 +70,10 @@ class PhonePlaylistTests(unittest.TestCase):
             }),
             mock.patch("phone_playlist.write_phone_playlist") as write_playlist,
         ):
-            result = generate_playlist_from_config(cfg, playlist_name="recent.m3u")
+            result = generate_playlist_from_config(cfg)
 
         self.assertEqual(result["tracks"], 1)
+        self.assertEqual(result["playlist"], "recent.m3u")
         write_playlist.assert_called_once()
         self.assertIn("Artist - Album [WEB V0]/01 Song.mp3", write_playlist.call_args.args[4])
 

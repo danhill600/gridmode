@@ -1,4 +1,4 @@
-package com.oldbeast.gridmode.lifeboat
+package org.gridmode.lifeboat
 
 import android.content.ContentResolver
 import android.content.Context
@@ -127,7 +127,7 @@ fun LifeboatApp() {
         libraryState = LibraryState.Loading
         libraryState = withContext(Dispatchers.IO) {
             runCatching { LibraryState.Ready(scanAlbums(context.contentResolver, uri)) }
-                .getOrElse { LibraryState.Error(it.message ?: "Could not scan lifeboat folder") }
+                .getOrElse { LibraryState.Error(it.message ?: "Could not scan music folder") }
         }
     }
 
@@ -152,7 +152,7 @@ fun LifeboatApp() {
                             libraryState = LibraryState.Loading
                             libraryState = withContext(Dispatchers.IO) {
                                 runCatching { LibraryState.Ready(scanAlbums(context.contentResolver, uri)) }
-                                    .getOrElse { LibraryState.Error(it.message ?: "Could not scan lifeboat folder") }
+                                    .getOrElse { LibraryState.Error(it.message ?: "Could not scan music folder") }
                             }
                         }
                     }
@@ -200,14 +200,14 @@ private fun LifeboatScreen(
         Spacer(Modifier.height(10.dp))
 
         when (state) {
-            LibraryState.MissingFolder -> EmptyState("Choose the lifeboat folder.", onPickFolder)
+            LibraryState.MissingFolder -> EmptyState("Choose the music folder.", onPickFolder)
             LibraryState.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
             is LibraryState.Error -> EmptyState(state.message, onPickFolder)
             is LibraryState.Ready -> {
                 if (state.albums.isEmpty()) {
-                    EmptyState("No albums found in lifeboat.", onPickFolder)
+                    EmptyState("No albums found in the selected music folder.", onPickFolder)
                 } else {
                     AlbumGrid(state.albums, onPlayAlbum)
                 }
