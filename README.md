@@ -99,6 +99,8 @@ specific but useful setup:
 
 - MPD can be local or remote.
 - The full music library lives on a machine reachable over SSH.
+- Or the full music library is local to the Gridmode machine, with
+  `music.ssh_host` left empty.
 - A lossy mirror may live beside that library.
 - The phone runs an SSH server, for example Termux `sshd`.
 - The phone exposes a writable music directory such as
@@ -126,8 +128,9 @@ looks like a host alias pointing at the phone's LAN address and port `8022`.
 
 Phone transfer dependencies:
 
-- The machine named by `music.ssh_host` needs `ssh`, `rsync`, Python 3, and
-  `ffmpeg` if `transcode_missing_lossy = true`.
+- The Gridmode machine needs `ssh` and `rsync`. If `music.ssh_host` is set, the
+  machine named there also needs `ssh`, `rsync`, Python 3, and `ffmpeg` if
+  `transcode_missing_lossy = true`.
 - The phone needs an SSH server running and `rsync` installed. In Termux:
 
 ```sh

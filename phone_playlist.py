@@ -19,8 +19,11 @@ def library_index_path(cache_dir):
 
 def load_library_index(cache_dir):
     path = library_index_path(cache_dir)
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
     albums = data.get("albums", [])
     if not isinstance(albums, list):
         return []
@@ -138,8 +141,15 @@ cat > "$root/$name"
         shlex.quote(phone_ssh_host),
         shlex.quote(phone_cmd),
     )
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd] if transfer_ssh_host else [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        phone_ssh_host,
+        phone_cmd,
+    ]
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        cmd,
         input=text,
         text=True,
         capture_output=True,

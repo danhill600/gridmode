@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from phone_playlist import generate_playlist_from_config, m3u_text, order_phone_albums
+from phone_playlist import generate_playlist_from_config, m3u_text, order_phone_albums, write_phone_playlist
 
 
 class PhonePlaylistTests(unittest.TestCase):
@@ -76,6 +76,36 @@ class PhonePlaylistTests(unittest.TestCase):
         self.assertEqual(result["playlist"], "recent.m3u")
         write_playlist.assert_called_once()
         self.assertIn("Artist - Album [WEB V0]/01 Song.mp3", write_playlist.call_args.args[4])
+
+    def test_write_phone_playlist_can_run_from_local_machine(self):
+        completed = mock.Mock(returncode=0, stderr="")
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            write_phone_playlist("", "phone", "/music", "recent.m3u", "#EXTM3U\n")
+
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["ssh", "-o", "BatchMode=yes"])
+        self.assertEqual(cmd[3], "phone")
+        self.assertEqual(run.call_args.kwargs["input"], "#EXTM3U\n")
+
+    def test_generate_playlist_tolerates_missing_library_index(self):
+        cfg = {
+            "cache": {"dir": "/missing-cache"},
+            "music": {"ssh_host": ""},
+            "phone": {"ssh_host": "phone", "music_root": "/music"},
+        }
+        with (
+            mock.patch("phone_playlist.list_phone_album_dirs", return_value=[
+                {"name": "Album", "mtime": 1},
+            ]),
+            mock.patch("phone_playlist.list_phone_album_tracks", return_value={
+                "Album": ["Album/01 Song.mp3"],
+            }),
+            mock.patch("phone_playlist.write_phone_playlist") as write_playlist,
+        ):
+            result = generate_playlist_from_config(cfg)
+
+        self.assertEqual(result["tracks"], 1)
+        write_playlist.assert_called_once()
 
 
 if __name__ == "__main__":

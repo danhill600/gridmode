@@ -69,8 +69,6 @@ def _run_cancelable(cmd, timeout, cancel_event=None, **kwargs):
 
 
 def list_phone_album_dirs(transfer_ssh_host, phone_ssh_host, phone_root, timeout=30):
-    if not transfer_ssh_host:
-        raise ValueError("phone listing requires music.ssh_host")
     if not phone_ssh_host:
         raise ValueError("phone listing requires phone.ssh_host")
     if not phone_root:
@@ -94,8 +92,15 @@ done
         shlex.quote(phone_ssh_host),
         shlex.quote(phone_cmd),
     )
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd] if transfer_ssh_host else [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        phone_ssh_host,
+        phone_cmd,
+    ]
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        cmd,
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -118,8 +123,6 @@ done
 
 
 def list_phone_album_tracks(transfer_ssh_host, phone_ssh_host, phone_root, album_names, timeout=120):
-    if not transfer_ssh_host:
-        raise ValueError("phone track listing requires music.ssh_host")
     if not phone_ssh_host:
         raise ValueError("phone track listing requires phone.ssh_host")
     if not phone_root:
@@ -166,8 +169,15 @@ done
         shlex.quote(phone_ssh_host),
         shlex.quote(phone_cmd),
     )
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd] if transfer_ssh_host else [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        phone_ssh_host,
+        phone_cmd,
+    ]
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        cmd,
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -196,8 +206,6 @@ def prepare_album_for_phone(
     timeout=900,
     cancel_event=None,
 ):
-    if not music_ssh_host:
-        raise ValueError("phone transfer requires music.ssh_host")
     if not music_root:
         raise ValueError("phone transfer requires music.root")
     if not rel_dir:
@@ -210,6 +218,8 @@ def prepare_album_for_phone(
         "prefer_lossy": bool(prefer_lossy),
         "transcode_missing": bool(transcode_missing),
     }
+    if not music_ssh_host:
+        return prepare_local_album_for_phone(payload)
     script = r"""
 import json
 import os
@@ -345,6 +355,72 @@ result(lossy, "lossy", created=True)
     return json.loads(proc.stdout)
 
 
+def prepare_local_album_for_phone(payload):
+    music_root = payload["music_root"]
+    rel_dir = payload["rel_dir"]
+    lossy_root = payload.get("lossy_root") or ""
+    prefer_lossy = bool(payload.get("prefer_lossy"))
+    transcode_missing = bool(payload.get("transcode_missing"))
+
+    source = os.path.normpath(os.path.join(music_root, rel_dir))
+    root = os.path.normpath(music_root)
+    if not source.startswith(root + os.sep):
+        raise RuntimeError("bad source path")
+    if not os.path.isdir(source):
+        raise RuntimeError("source album directory not found: " + source)
+    if not prefer_lossy:
+        return {"path": source, "kind": "source", "created": False, "matched": False}
+    if not lossy_root:
+        raise RuntimeError("lossy requested but music.lossy_root is not configured")
+
+    lossy = os.path.normpath(os.path.join(lossy_root, rel_dir))
+    lossy_base = os.path.normpath(lossy_root)
+    if not lossy.startswith(lossy_base + os.sep):
+        raise RuntimeError("bad lossy path")
+    if os.path.isdir(lossy):
+        return {"path": lossy, "kind": "lossy", "created": False, "matched": False}
+
+    matched_lossy = find_existing_local_lossy(lossy_root, rel_dir)
+    if matched_lossy:
+        return {"path": matched_lossy, "kind": "lossy", "created": False, "matched": True}
+    if not transcode_missing:
+        raise RuntimeError("lossy album not found: " + lossy)
+    raise RuntimeError("local transcode_missing_lossy is not implemented")
+
+
+def find_existing_local_lossy(lossy_root, rel_dir):
+    rel_parent = os.path.dirname(rel_dir)
+    source_leaf = os.path.basename(rel_dir)
+    lossy_parent = os.path.normpath(os.path.join(lossy_root, rel_parent))
+    lossy_base = os.path.normpath(lossy_root)
+    if not lossy_parent.startswith(lossy_base):
+        return ""
+    wanted = lossy_album_match_key(source_leaf)
+    if not wanted or not os.path.isdir(lossy_parent):
+        return ""
+    for name in sorted(os.listdir(lossy_parent)):
+        if name.startswith("."):
+            continue
+        candidate = os.path.normpath(os.path.join(lossy_parent, name))
+        if not candidate.startswith(lossy_base + os.sep):
+            continue
+        if os.path.isdir(candidate) and lossy_album_match_key(name) == wanted and has_phone_audio(candidate):
+            return candidate
+    return ""
+
+
+def has_phone_audio(path):
+    copy_as_is = (".mp3", ".m4a", ".ogg", ".opus")
+    for current, dirs, files in os.walk(path):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            if os.path.splitext(name)[1].casefold() in copy_as_is:
+                return True
+    return False
+
+
 def copy_remote_album_to_phone(
     transfer_ssh_host,
     source_dir,
@@ -353,8 +429,6 @@ def copy_remote_album_to_phone(
     timeout=900,
     cancel_event=None,
 ):
-    if not transfer_ssh_host:
-        raise ValueError("transfer ssh host is required")
     if not source_dir:
         raise ValueError("source directory is required")
     if not phone_ssh_host:
@@ -368,14 +442,26 @@ def copy_remote_album_to_phone(
 
     source_arg = source_dir.rstrip("/") + "/"
     dest_arg = f"{phone_ssh_host}:{phone_root.rstrip('/')}/{leaf}/"
-    mkdir_cmd = "mkdir -p " + shlex.quote(phone_root)
-    cmd_text = "ssh -o BatchMode=yes {} {} && rsync -a --delete {} {}".format(
-        shlex.quote(phone_ssh_host),
-        shlex.quote(mkdir_cmd),
-        shlex.quote(source_arg),
-        shlex.quote(dest_arg),
-    )
-    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, cmd_text]
+    if transfer_ssh_host:
+        mkdir_cmd = "mkdir -p " + shlex.quote(phone_root)
+        cmd_text = "ssh -o BatchMode=yes {} {} && rsync -a --delete {} {}".format(
+            shlex.quote(phone_ssh_host),
+            shlex.quote(mkdir_cmd),
+            shlex.quote(source_arg),
+            shlex.quote(dest_arg),
+        )
+        cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, cmd_text]
+    else:
+        cmd = [
+            "sh",
+            "-c",
+            "ssh -o BatchMode=yes \"$1\" \"mkdir -p \\\"$2\\\"\" && rsync -a --delete \"$3\" \"$4\"",
+            "gridmode-copy-phone",
+            phone_ssh_host,
+            phone_root,
+            source_arg,
+            dest_arg,
+        ]
     proc = _run_cancelable(
         cmd,
         timeout,
@@ -390,8 +476,6 @@ def copy_remote_album_to_phone(
 
 
 def phone_album_dir_exists(transfer_ssh_host, phone_ssh_host, phone_root, album_name, timeout=60, cancel_event=None):
-    if not transfer_ssh_host:
-        raise ValueError("phone exists check requires music.ssh_host")
     if not phone_ssh_host:
         raise ValueError("phone exists check requires phone.ssh_host")
     if not phone_root:
@@ -413,8 +497,15 @@ name=$2
         shlex.quote(phone_ssh_host),
         shlex.quote(phone_cmd),
     )
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd] if transfer_ssh_host else [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        phone_ssh_host,
+        phone_cmd,
+    ]
     proc = _run_cancelable(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        cmd,
         timeout,
         cancel_event,
         text=True,
@@ -429,8 +520,6 @@ name=$2
 
 
 def delete_phone_album_dir(transfer_ssh_host, phone_ssh_host, phone_root, phone_rel_dir, timeout=120):
-    if not transfer_ssh_host:
-        raise ValueError("phone delete requires music.ssh_host")
     if not phone_ssh_host:
         raise ValueError("phone delete requires phone.ssh_host")
     if not phone_root:
@@ -463,8 +552,15 @@ printf '%s\t%s\n' "deleted" "$rel_dir"
         shlex.quote(phone_ssh_host),
         shlex.quote(phone_cmd),
     )
+    cmd = ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd] if transfer_ssh_host else [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        phone_ssh_host,
+        phone_cmd,
+    ]
     proc = _run_cancelable(
-        ["ssh", "-o", "BatchMode=yes", transfer_ssh_host, transfer_cmd],
+        cmd,
         timeout,
         text=True,
         stdout=subprocess.PIPE,
@@ -489,7 +585,15 @@ def copy_local_cover_to_remote_album(
     if not local_cover_path or not os.path.exists(local_cover_path):
         return False
     if not remote_ssh_host or not remote_album_dir:
-        return False
+        if not remote_album_dir:
+            return False
+        os.makedirs(remote_album_dir, exist_ok=True)
+        dest = os.path.join(remote_album_dir, "cover.png")
+        if os.path.abspath(local_cover_path) == os.path.abspath(dest):
+            return True
+        with open(local_cover_path, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+        return True
 
     dest = posixpath.join(remote_album_dir.rstrip("/"), "cover.png")
     with open(local_cover_path, "rb") as cover:

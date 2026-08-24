@@ -8,6 +8,7 @@ from unittest import mock
 from phone_service import (
     PhoneTransferCancelled,
     _run_cancelable,
+    copy_remote_album_to_phone,
     delete_phone_album_dir,
     list_phone_album_tracks,
     lossy_album_match_key,
@@ -94,6 +95,15 @@ class PhoneAlbumExistsTests(unittest.TestCase):
         with mock.patch("phone_service._run_cancelable", return_value=completed):
             self.assertFalse(phone_album_dir_exists("music-host", "phone", "/music", "Album"))
 
+    def test_phone_album_dir_exists_can_run_from_local_machine(self):
+        completed = subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+        with mock.patch("phone_service._run_cancelable", return_value=completed) as run:
+            self.assertTrue(phone_album_dir_exists("", "phone", "/music", "Album"))
+
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["ssh", "-o", "BatchMode=yes"])
+        self.assertEqual(cmd[3], "phone")
+
 
 class PhoneAlbumTracksTests(unittest.TestCase):
     def test_list_phone_album_tracks_quotes_names_for_nested_ssh(self):
@@ -111,6 +121,18 @@ class PhoneAlbumTracksTests(unittest.TestCase):
         transfer_cmd = cmd[-1]
         self.assertIn("ssh -o BatchMode=yes phone 'sh -c", transfer_cmd)
         self.assertIn("'\"'\"'Album; nope'\"'\"'", transfer_cmd)
+
+
+class CopyPhoneAlbumTests(unittest.TestCase):
+    def test_copy_album_can_run_from_local_machine(self):
+        completed = subprocess.CompletedProcess(["sh"], 0, stdout="", stderr="")
+        with mock.patch("phone_service._run_cancelable", return_value=completed) as run:
+            result = copy_remote_album_to_phone("", "/music/Artist - Album", "phone", "/phone")
+
+        self.assertEqual(result["name"], "Artist - Album")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["sh", "-c", 'ssh -o BatchMode=yes "$1" "mkdir -p \\"$2\\"" && rsync -a --delete "$3" "$4"'])
+        self.assertEqual(cmd[4:8], ["phone", "/phone", "/music/Artist - Album/", "phone:/phone/Artist - Album/"])
 
 
 if __name__ == "__main__":
